@@ -376,6 +376,22 @@ class CreateAsset(SyftObject):
         if isinstance(data, SyftError):
             raise SyftException(data)
         self.data = data
+        
+    def generate_synthetic_mock(self) -> None:
+        from sdv.metadata import SingleTableMetadata
+        from sdv.lite import SingleTablePreset
+        
+        metadata = SingleTableMetadata()
+        metadata.detect_from_dataframe(self.data)
+        
+        synthesizer = SingleTablePreset(metadata, name='FAST_ML')
+        synthesizer.fit(self.data)
+        # from sdv.single_table import GaussianCopulaSynthesizer
+        # synthesizer = GaussianCopulaSynthesizer(metadata)
+        # synthesizer.fit(self.data)
+        
+        synthetic_data = synthesizer.sample(num_rows=7)
+        return synthetic_data
 
     def set_mock(self, mock_data: Any, mock_is_real: bool) -> None:
         if isinstance(mock_data, SyftError):

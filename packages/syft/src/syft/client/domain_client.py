@@ -124,6 +124,11 @@ class DomainClient(SyftClient):
 
         for asset in tqdm(dataset.asset_list):
             print(f"Uploading: {asset.name}")
+            
+            if asset.mock == "auto-generate":
+                import pandas
+                assert isinstance(asset.data, pandas.DataFrame), "Need to pass a dataframe as private for this feature"
+                asset.mock = asset.generate_synthetic_mock()
             try:
                 twin = TwinObject(
                     private_obj=asset.data,
