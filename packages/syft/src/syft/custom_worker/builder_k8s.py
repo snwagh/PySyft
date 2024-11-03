@@ -1,6 +1,7 @@
 # stdlib
 from hashlib import sha256
 from pathlib import Path
+from secrets import token_hex
 from typing import Any
 
 # third party
@@ -9,27 +10,32 @@ from kr8s.objects import Job
 from kr8s.objects import Secret
 
 # relative
+from ..types.errors import SyftException
 from .builder_types import BUILD_IMAGE_TIMEOUT_SEC
 from .builder_types import BuilderBase
 from .builder_types import ImageBuildResult
 from .builder_types import ImagePushResult
 from .builder_types import PUSH_IMAGE_TIMEOUT_SEC
 from .k8s import INTERNAL_REGISTRY_HOST
-from .k8s import JOB_COMPLETION_TTL
+from .k8s import KANIKO_VERSION
 from .k8s import KUBERNETES_NAMESPACE
 from .k8s import KubeUtils
+from .k8s import USE_INTERNAL_REGISTRY
 from .k8s import get_kr8s_client
 from .utils import ImageUtils
 
 __all__ = ["KubernetesBuilder"]
 
 
-class BuildFailed(Exception):
-    pass
-
-
 class KubernetesBuilder(BuilderBase):
+    # app.kubernetes.io/component
     COMPONENT = "builder"
+
+    # service account for the Job, useful for workload identity
+    SERVICE_ACCOUNT = "builder-service-account"
+
+    # Time after which Job will be deleted
+    JOB_COMPLETION_TTL = 60
 
     def __init__(self) -> None:
         self.client = get_kr8s_client()
@@ -46,11 +52,22 @@ class KubernetesBuilder(BuilderBase):
         logs = None
         config = None
         job_id = self._new_job_id(tag)
+        kaniko_extra_args = None
 
         if dockerfile:
             pass
         elif dockerfile_path:
             dockerfile = dockerfile_path.read_text()
+
+        if USE_INTERNAL_REGISTRY:
+            # if we are using internal registry, we tweak the tag to point to it
+            tag = ImageUtils.change_registry(tag, registry=INTERNAL_REGISTRY_HOST)
+
+            # and let kaniko know about the internal registry
+            kaniko_extra_args = [
+                f"--insecure-registry={INTERNAL_REGISTRY_HOST}",
+                f"--skip-tls-verify-registry={INTERNAL_REGISTRY_HOST}",
+            ]
 
         try:
             # Create a ConfigMap with the Dockerfile
@@ -63,6 +80,7 @@ class KubernetesBuilder(BuilderBase):
                 tag=tag,
                 job_config=config,
                 build_args=buildargs,
+                kaniko_extra_args=kaniko_extra_args,
             )
 
             # wait for job to complete/fail
@@ -77,10 +95,12 @@ class KubernetesBuilder(BuilderBase):
             image_digest = self._get_image_digest(job)
             if not image_digest:
                 exit_code = self._get_exit_code(job)
-                raise BuildFailed(
-                    "Failed to build the image. "
-                    f"Kaniko exit code={exit_code}. "
-                    f"Logs={logs}"
+                raise SyftException(
+                    public_message=(
+                        "Failed to build the image."
+                        f" Kaniko exit code={exit_code}."
+                        f" Logs={logs}"
+                    )
                 )
 
         except Exception:
@@ -97,22 +117,33 @@ class KubernetesBuilder(BuilderBase):
     def push_image(
         self,
         tag: str,
-        username: str,
-        password: str,
         registry_url: str,
+        username: str | None = None,
+        password: str | None = None,
         **kwargs: Any,
     ) -> ImagePushResult:
         exit_code = 1
         logs = None
         job_id = self._new_job_id(tag)
         push_secret = None
+        registry_auths = []
+
+        if USE_INTERNAL_REGISTRY:
+            # local registry auth can be anything
+            registry_auths.append((INTERNAL_REGISTRY_HOST, "admin", token_hex(4)))
+        else:
+            # kaniko has already pushed the image directly
+            return ImagePushResult(logs="Already pushed", exit_code=0)
+
+        # if we have external registry credentials, add them to the list
+        # elsea leave it for workload identity
+        if username and password:
+            registry_auths.append((registry_url, username, password))
 
         try:
             push_secret = self._create_push_secret(
-                id=job_id,
-                url=registry_url,
-                username=username,
-                password=password,
+                job_id=job_id,
+                registry_auths=registry_auths,
             )
             push_secret.refresh()
 
@@ -142,17 +173,17 @@ class KubernetesBuilder(BuilderBase):
         return sha256(tag.encode()).hexdigest()
 
     def _get_image_digest(self, job: Job) -> str | None:
-        selector = {"batch.kubernetes.io/job-name": job.metadata.name}
+        selector = {"job-name": job.metadata.name}
         pods = self.client.get("pods", label_selector=selector)
         return KubeUtils.get_container_exit_message(pods)
 
     def _get_exit_code(self, job: Job) -> list[int]:
-        selector = {"batch.kubernetes.io/job-name": job.metadata.name}
+        selector = {"job-name": job.metadata.name}
         pods = self.client.get("pods", label_selector=selector)
         return KubeUtils.get_container_exit_code(pods)
 
     def _get_logs(self, job: Job) -> str:
-        selector = {"batch.kubernetes.io/job-name": job.metadata.name}
+        selector = {"job-name": job.metadata.name}
         pods = self.client.get("pods", label_selector=selector)
         return KubeUtils.get_logs(pods)
 
@@ -180,12 +211,12 @@ class KubernetesBuilder(BuilderBase):
         tag: str,
         job_config: ConfigMap,
         build_args: dict | None = None,
+        kaniko_extra_args: list[str] | None = None,
     ) -> Job:
         # for push
         build_args = build_args or {}
+        kaniko_extra_args = kaniko_extra_args or []
         build_args_list = []
-
-        internal_tag = ImageUtils.change_registry(tag, registry=INTERNAL_REGISTRY_HOST)
 
         for k, v in build_args.items():
             build_args_list.append(f'--build-arg="{k}={v}"')
@@ -202,35 +233,34 @@ class KubernetesBuilder(BuilderBase):
                 },
                 "spec": {
                     "backoffLimit": 0,
-                    "ttlSecondsAfterFinished": JOB_COMPLETION_TTL,
+                    "ttlSecondsAfterFinished": KubernetesBuilder.JOB_COMPLETION_TTL,
                     "template": {
                         "spec": {
                             "restartPolicy": "Never",
+                            "serviceAccountName": KubernetesBuilder.SERVICE_ACCOUNT,
                             "containers": [
                                 {
                                     "name": "kaniko",
-                                    "image": "gcr.io/kaniko-project/executor:latest",
+                                    "image": f"gcr.io/kaniko-project/executor:{KANIKO_VERSION}",
                                     "args": [
                                         "--dockerfile=Dockerfile",
                                         "--context=dir:///workspace",
-                                        f"--destination={internal_tag}",
+                                        f"--destination={tag}",
                                         # Disabling --reproducible because it eats up a lot of CPU+RAM
                                         # https://github.com/GoogleContainerTools/kaniko/issues/1960
                                         # https://github.com/GoogleContainerTools/kaniko/pull/2477
                                         # "--reproducible",
-                                        # cache args
+                                        # Cache
                                         "--cache=true",
                                         "--cache-copy-layers",
                                         "--cache-run-layers",
-                                        f"--cache-repo={INTERNAL_REGISTRY_HOST}/builder-cache",
                                         # outputs args
                                         "--digest-file=/dev/termination-log",
                                         # other kaniko conf
-                                        f"--insecure-registry={INTERNAL_REGISTRY_HOST}",
-                                        f"--skip-tls-verify-registry={INTERNAL_REGISTRY_HOST}",
                                         "--log-format=text",
                                         "--verbosity=info",
                                     ]
+                                    + kaniko_extra_args
                                     + build_args_list,
                                     "volumeMounts": [
                                         {
@@ -238,17 +268,6 @@ class KubernetesBuilder(BuilderBase):
                                             "mountPath": "/workspace",
                                         },
                                     ],
-                                    "resources": {
-                                        "requests": {
-                                            "memory": "4Gi",
-                                            "cpu": "2",
-                                        },
-                                        "limits": {
-                                            "memory": "16Gi",
-                                            "cpu": "4",
-                                        },
-                                        "ephemeral-storage": "10Gi",
-                                    },
                                 }
                             ],
                             "volumes": [
@@ -279,11 +298,11 @@ class KubernetesBuilder(BuilderBase):
         run_cmds = [
             # push with credentials
             "echo Pushing image...",
-            f"crane copy {internal_tag} {tag}",
+            f"krane copy {internal_tag} {tag}",
             # cleanup image from internal registry
             "echo Cleaning up...",
-            f"IMG_DIGEST=$(crane digest {internal_tag})",
-            f"crane delete {internal_reg}/{internal_repo}@$IMG_DIGEST; echo Done",
+            f"IMG_DIGEST=$(krane digest {internal_tag})",
+            f"krane delete {internal_reg}/{internal_repo}@$IMG_DIGEST; echo Done",
         ]
 
         job = Job(
@@ -299,15 +318,16 @@ class KubernetesBuilder(BuilderBase):
                 },
                 "spec": {
                     "backoffLimit": 0,
-                    "ttlSecondsAfterFinished": JOB_COMPLETION_TTL,
+                    "ttlSecondsAfterFinished": KubernetesBuilder.JOB_COMPLETION_TTL,
                     "template": {
                         "spec": {
                             "restartPolicy": "Never",
+                            "serviceAccountName": KubernetesBuilder.SERVICE_ACCOUNT,
                             "containers": [
                                 {
                                     "name": "crane",
                                     # debug is needed for "sh" to be available
-                                    "image": "gcr.io/go-containerregistry/crane:debug",
+                                    "image": "gcr.io/go-containerregistry/krane:debug",
                                     "command": ["sh"],
                                     "args": ["-c", " && ".join(run_cmds)],
                                     "volumeMounts": [
@@ -318,17 +338,6 @@ class KubernetesBuilder(BuilderBase):
                                             "readOnly": True,
                                         },
                                     ],
-                                    "resources": {
-                                        "requests": {
-                                            "memory": "2Gi",
-                                            "cpu": "1",
-                                        },
-                                        "limits": {
-                                            "memory": "4Gi",
-                                            "cpu": "2",
-                                            "ephemeral-storage": "1Gi",
-                                        },
-                                    },
                                 }
                             ],
                             "volumes": [
@@ -353,14 +362,12 @@ class KubernetesBuilder(BuilderBase):
         return KubeUtils.create_or_get(job)
 
     def _create_push_secret(
-        self, id: str, url: str, username: str, password: str
+        self,
+        job_id: str,
+        registry_auths: list[tuple[str, str, str]],
     ) -> Secret:
         return KubeUtils.create_dockerconfig_secret(
-            secret_name=f"push-secret-{id}",
+            secret_name=f"push-secret-{job_id}",
             component=KubernetesBuilder.COMPONENT,
-            registries=[
-                # TODO: authorize internal registry?
-                (INTERNAL_REGISTRY_HOST, "username", id),
-                (url, username, password),
-            ],
+            registries=registry_auths,
         )

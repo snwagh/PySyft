@@ -41,8 +41,10 @@ Read/retrieve SyftObject from blob storage
 """
 
 # stdlib
+from collections.abc import Callable
 from collections.abc import Generator
 from io import BytesIO
+import logging
 from typing import Any
 
 # third party
@@ -53,7 +55,6 @@ from typing_extensions import Self
 # relative
 from ...serde.deserialize import _deserialize as deserialize
 from ...serde.serializable import serializable
-from ...service.response import SyftError
 from ...service.response import SyftSuccess
 from ...types.base import SyftBaseModel
 from ...types.blob_storage import BlobFile
@@ -62,12 +63,17 @@ from ...types.blob_storage import BlobStorageEntry
 from ...types.blob_storage import CreateBlobStorageEntry
 from ...types.blob_storage import DEFAULT_CHUNK_SIZE
 from ...types.blob_storage import SecureFilePathLocation
-from ...types.grid_url import GridURL
-from ...types.syft_object import SYFT_OBJECT_VERSION_2
-from ...types.syft_object import SYFT_OBJECT_VERSION_3
-from ...types.syft_object import SYFT_OBJECT_VERSION_4
+from ...types.errors import SyftException
+from ...types.result import as_result
+from ...types.server_url import ServerURL
+from ...types.syft_migration import migrate
+from ...types.syft_object import SYFT_OBJECT_VERSION_1
 from ...types.syft_object import SyftObject
+from ...types.transforms import drop
+from ...types.transforms import make_set_default
 from ...types.uid import UID
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10
 MAX_RETRIES = 20
@@ -76,7 +82,7 @@ MAX_RETRIES = 20
 @serializable()
 class BlobRetrieval(SyftObject):
     __canonical_name__ = "BlobRetrieval"
-    __version__ = SYFT_OBJECT_VERSION_3
+    __version__ = SYFT_OBJECT_VERSION_1
 
     type_: type | None = None
     file_name: str
@@ -87,7 +93,7 @@ class BlobRetrieval(SyftObject):
 @serializable()
 class SyftObjectRetrieval(BlobRetrieval):
     __canonical_name__ = "SyftObjectRetrieval"
-    __version__ = SYFT_OBJECT_VERSION_4
+    __version__ = SYFT_OBJECT_VERSION_1
 
     syft_object: bytes
 
@@ -106,21 +112,21 @@ class SyftObjectRetrieval(BlobRetrieval):
         else:
             return res
 
-    def read(self, _deserialize: bool = True) -> SyftObject | SyftError:
+    def read(self, _deserialize: bool = True) -> SyftObject:
         return self._read_data(_deserialize=_deserialize)
 
 
 def syft_iter_content(
-    blob_url: str | GridURL,
+    blob_url: str | ServerURL,
     chunk_size: int,
     max_retries: int = MAX_RETRIES,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Generator:
-    """custom iter content with smart retries (start from last byte read)"""
+    """Custom iter content with smart retries (start from last byte read)"""
     current_byte = 0
     for attempt in range(max_retries):
+        headers = {"Range": f"bytes={current_byte}-"}
         try:
-            headers = {"Range": f"bytes={current_byte}-"}
             with requests.get(
                 str(blob_url), stream=True, headers=headers, timeout=(timeout, timeout)
             ) as response:
@@ -130,31 +136,31 @@ def syft_iter_content(
                 ):
                     current_byte += len(chunk)
                     yield chunk
-                return
-
+            return  # If successful, exit the function
         except requests.exceptions.RequestException as e:
             if attempt < max_retries:
-                print(
+                logger.debug(
                     f"Attempt {attempt}/{max_retries} failed: {e} at byte {current_byte}. Retrying..."
                 )
             else:
-                print(f"Max retries reached. Failed with error: {e}")
-                raise
+                logger.error(f"Max retries reached - {e}")
+                raise SyftException(public_message=f"Max retries reached - {e}")
 
 
 @serializable()
 class BlobRetrievalByURL(BlobRetrieval):
     __canonical_name__ = "BlobRetrievalByURL"
-    __version__ = SYFT_OBJECT_VERSION_4
+    __version__ = SYFT_OBJECT_VERSION_1
 
-    url: GridURL | str
+    url: ServerURL | str
+    proxy_server_uid: UID | None = None
 
-    def read(self) -> SyftObject | SyftError:
+    def read(self) -> SyftObject:
         if self.type_ is BlobFileType:
             return BlobFile(
                 file_name=self.file_name,
                 syft_client_verify_key=self.syft_client_verify_key,
-                syft_node_location=self.syft_node_location,
+                syft_server_location=self.syft_server_location,
                 syft_blob_storage_entry_id=self.syft_blob_storage_entry_id,
                 file_size=self.file_size,
             )
@@ -171,44 +177,55 @@ class BlobRetrievalByURL(BlobRetrieval):
         # relative
         from ...client.api import APIRegistry
 
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_location,
-            user_verify_key=self.syft_client_verify_key,
-        )
-        if api and api.connection and isinstance(self.url, GridURL):
-            blob_url = api.connection.to_blob_route(
-                self.url.url_path, host=self.url.host_or_ip
-            )
+        api = self.get_api_wrapped()
+
+        if api.is_ok() and api.unwrap().connection and isinstance(self.url, ServerURL):
+            api = api.unwrap()
+            if self.proxy_server_uid is None:
+                blob_url = api.connection.to_blob_route(  # type: ignore [union-attr]
+                    self.url.url_path, host=self.url.host_or_ip
+                )
+            else:
+                blob_url = api.connection.stream_via(  # type: ignore [union-attr]
+                    self.proxy_server_uid, self.url.url_path
+                )
+                stream = True
         else:
             blob_url = self.url
+
         try:
-            if self.type_ is BlobFileType:
-                if stream:
-                    return syft_iter_content(blob_url, chunk_size)
-                else:
-                    response = requests.get(str(blob_url), stream=False)  # nosec
-                    response.raise_for_status()
-                    return response.content
-            else:
-                response = requests.get(str(blob_url), stream=stream)  # nosec
-                response.raise_for_status()
-                return deserialize(response.content, from_bytes=True)
+            is_blob_file = self.type_ is not None and issubclass(
+                self.type_, BlobFileType
+            )
+            if is_blob_file and stream:
+                return syft_iter_content(blob_url, chunk_size)
+
+            response = requests.get(str(blob_url), stream=stream)  # nosec
+            resp_content = response.content
+            response.raise_for_status()
+
+            return (
+                resp_content
+                if is_blob_file
+                else deserialize(resp_content, from_bytes=True)
+            )
         except requests.RequestException as e:
-            return SyftError(message=f"Failed to retrieve with Error: {e}")
+            raise SyftException(public_message=f"Failed to retrieve with error: {e}")
 
 
 @serializable()
 class BlobDeposit(SyftObject):
     __canonical_name__ = "BlobDeposit"
-    __version__ = SYFT_OBJECT_VERSION_2
+    __version__ = SYFT_OBJECT_VERSION_1
 
     blob_storage_entry_id: UID
 
-    def write(self, data: BytesIO) -> SyftSuccess | SyftError:
+    @as_result(SyftException)
+    def write(self, data: BytesIO) -> SyftSuccess:
         raise NotImplementedError
 
 
-@serializable()
+@serializable(canonical_name="BlobStorageClientConfig", version=1)
 class BlobStorageClientConfig(BaseModel):
     pass
 
@@ -223,9 +240,7 @@ class BlobStorageConnection:
     def read(self, fp: SecureFilePathLocation, type_: type | None) -> BlobRetrieval:
         raise NotImplementedError
 
-    def allocate(
-        self, obj: CreateBlobStorageEntry
-    ) -> SecureFilePathLocation | SyftError:
+    def allocate(self, obj: CreateBlobStorageEntry) -> SecureFilePathLocation:
         raise NotImplementedError
 
     def write(self, obj: BlobStorageEntry) -> BlobDeposit:
@@ -235,7 +250,7 @@ class BlobStorageConnection:
         raise NotImplementedError
 
 
-@serializable()
+@serializable(canonical_name="BlobStorageClient", version=1)
 class BlobStorageClient(SyftBaseModel):
     config: BlobStorageClientConfig
 
@@ -243,7 +258,8 @@ class BlobStorageClient(SyftBaseModel):
         raise NotImplementedError
 
 
-@serializable()
+@serializable(canonical_name="BlobStorageConfig", version=1)
 class BlobStorageConfig(SyftBaseModel):
     client_type: type[BlobStorageClient]
     client_config: BlobStorageClientConfig
+    min_blob_size: int = 0  # in MB

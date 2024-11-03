@@ -13,7 +13,7 @@ from .k8s import PodStatus
 from .k8s import get_kr8s_client
 
 JSONPATH_AVAILABLE_REPLICAS = "{.status.availableReplicas}"
-CREATE_POOL_TIMEOUT_SEC = 60
+CREATE_POOL_TIMEOUT_SEC = 380
 SCALE_POOL_TIMEOUT_SEC = 60
 
 
@@ -28,19 +28,21 @@ class KubernetesRunner:
         replicas: int = 1,
         env_vars: list[dict] | None = None,
         mount_secrets: dict | None = None,
-        reg_username: str | None = None,
-        reg_password: str | None = None,
+        registry_username: str | None = None,
+        registry_password: str | None = None,
         reg_url: str | None = None,
+        pod_annotations: dict[str, str] | None = None,
+        pod_labels: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> StatefulSet:
         try:
             # create pull secret if registry credentials are passed
             pull_secret = None
-            if reg_username and reg_password and reg_url:
+            if registry_username and registry_password and reg_url:
                 pull_secret = self._create_image_pull_secret(
                     pool_name,
-                    reg_username,
-                    reg_password,
+                    registry_username,
+                    registry_password,
                     reg_url,
                 )
 
@@ -52,6 +54,8 @@ class KubernetesRunner:
                 env_vars=env_vars,
                 mount_secrets=mount_secrets,
                 pull_secret=pull_secret,
+                pod_annotations=pod_annotations,
+                pod_labels=pod_labels,
                 **kwargs,
             )
 
@@ -60,8 +64,6 @@ class KubernetesRunner:
                 f"jsonpath='{JSONPATH_AVAILABLE_REPLICAS}'={replicas}",
                 timeout=CREATE_POOL_TIMEOUT_SEC,
             )
-        except Exception:
-            raise
         finally:
             if pull_secret:
                 pull_secret.delete(propagation_policy="Foreground")
@@ -71,12 +73,13 @@ class KubernetesRunner:
 
     def scale_pool(self, pool_name: str, replicas: int) -> StatefulSet | None:
         deployment = self.get_pool(pool_name)
+        timeout = max(SCALE_POOL_TIMEOUT_SEC * replicas, SCALE_POOL_TIMEOUT_SEC)
         if not deployment:
             return None
         deployment.scale(replicas)
         deployment.wait(
             f"jsonpath='{JSONPATH_AVAILABLE_REPLICAS}'={replicas}",
-            timeout=SCALE_POOL_TIMEOUT_SEC,
+            timeout=timeout,
         )
         return deployment
 
@@ -93,9 +96,11 @@ class KubernetesRunner:
         selector = {"app.kubernetes.io/component": pool_name}
         for _set in self.client.get("statefulsets", label_selector=selector):
             _set.delete(propagation_policy="Foreground")
+            _set.wait(conditions="delete")
 
         for _secret in self.client.get("secrets", label_selector=selector):
             _secret.delete(propagation_policy="Foreground")
+            _secret.wait(conditions="delete")
 
         return True
 
@@ -128,8 +133,8 @@ class KubernetesRunner:
     def _create_image_pull_secret(
         self,
         pool_name: str,
-        reg_username: str,
-        reg_password: str,
+        registry_username: str,
+        registry_password: str,
         reg_url: str,
         **kwargs: Any,
     ) -> Secret:
@@ -137,7 +142,7 @@ class KubernetesRunner:
             secret_name=f"pull-secret-{pool_name}",
             component=pool_name,
             registries=[
-                (reg_url, reg_username, reg_password),
+                (reg_url, registry_username, registry_password),
             ],
         )
 
@@ -149,6 +154,8 @@ class KubernetesRunner:
         env_vars: list[dict] | None = None,
         mount_secrets: dict | None = None,
         pull_secret: Secret | None = None,
+        pod_annotations: dict[str, str] | None = None,
+        pod_labels: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> StatefulSet:
         """Create a stateful set for a pool"""
@@ -184,6 +191,16 @@ class KubernetesRunner:
                 }
             ]
 
+        default_pod_labels = {
+            "app.kubernetes.io/name": KUBERNETES_NAMESPACE,
+            "app.kubernetes.io/component": pool_name,
+        }
+
+        if isinstance(pod_labels, dict):
+            pod_labels = {**default_pod_labels, **pod_labels}
+        else:
+            pod_labels = default_pod_labels
+
         stateful_set = StatefulSet(
             {
                 "metadata": {
@@ -203,12 +220,12 @@ class KubernetesRunner:
                     },
                     "template": {
                         "metadata": {
-                            "labels": {
-                                "app.kubernetes.io/name": KUBERNETES_NAMESPACE,
-                                "app.kubernetes.io/component": pool_name,
-                            }
+                            "labels": pod_labels,
+                            "annotations": pod_annotations,
                         },
                         "spec": {
+                            # TODO: make this configurable
+                            "serviceAccountName": "backend-service-account",
                             "containers": [
                                 {
                                     "name": pool_name,
@@ -216,6 +233,23 @@ class KubernetesRunner:
                                     "image": tag,
                                     "env": env_vars,
                                     "volumeMounts": volume_mounts,
+                                    "livenessProbe": {
+                                        "httpGet": {
+                                            "path": "/api/v2/metadata?probe=livenessProbe",
+                                            "port": 80,
+                                        },
+                                        "periodSeconds": 15,
+                                        "timeoutSeconds": 5,
+                                        "failureThreshold": 3,
+                                    },
+                                    "startupProbe": {
+                                        "httpGet": {
+                                            "path": "/api/v2/metadata?probe=startupProbe",
+                                            "port": 80,
+                                        },
+                                        "failureThreshold": 30,
+                                        "periodSeconds": 10,
+                                    },
                                 }
                             ],
                             "volumes": volumes,

@@ -41,6 +41,8 @@ class DockerBuilder(BuilderBase):
                 tag=tag,
                 timeout=BUILD_IMAGE_TIMEOUT_SEC,
                 buildargs=buildargs,
+                rm=True,
+                labels={"orgs.openmined.syft": f"Build image {tag}"},
                 **kwargs,
             )
             return ImageBuildResult(
@@ -53,9 +55,9 @@ class DockerBuilder(BuilderBase):
     def push_image(
         self,
         tag: str,
-        username: str,
-        password: str,
         registry_url: str,
+        username: str | None = None,
+        password: str | None = None,
         **kwargs: Any,
     ) -> ImagePushResult:
         with contextlib.closing(docker.from_env()) as client:

@@ -6,19 +6,18 @@ import pytest
 
 # syft absolute
 import syft as sy
-from syft.service.response import SyftError
+from syft.types.errors import SyftException
 
 
-@pytest.mark.local_node
+@pytest.mark.local_server
 def test_enclave_root_client_exception():
-    enclave_node = sy.orchestra.launch(
+    enclave_server = sy.orchestra.launch(
         name=token_hex(8),
-        node_type=sy.NodeType.ENCLAVE,
+        server_type=sy.ServerType.ENCLAVE,
         dev_mode=True,
         reset=True,
-        local_db=True,
     )
-    res = enclave_node.login(email="info@openmined.org", password="changethis")
-    assert isinstance(res, SyftError)
-    enclave_node.python_node.cleanup()
-    enclave_node.land()
+    with pytest.raises(SyftException):
+        enclave_server.login(email="info@openmined.org", password="changethis")
+    enclave_server.python_server.cleanup()
+    enclave_server.land()

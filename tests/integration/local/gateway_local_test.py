@@ -1,5 +1,7 @@
 # stdlib
+import os
 from secrets import token_hex
+import time
 
 # third party
 from faker import Faker
@@ -7,175 +9,292 @@ import pytest
 
 # syft absolute
 import syft as sy
-from syft.abstract_node import NodeType
-from syft.client.domain_client import DomainClient
+from syft.abstract_server import ServerType
+from syft.client.datasite_client import DatasiteClient
 from syft.client.enclave_client import EnclaveClient
 from syft.client.gateway_client import GatewayClient
-from syft.service.network.node_peer import NodePeer
+from syft.service.network.network_service import ServerPeerAssociationStatus
+from syft.service.network.server_peer import ServerPeer
+from syft.service.network.server_peer import ServerPeerConnectionStatus
+from syft.service.network.utils import PeerHealthCheckTask
+from syft.service.request.request import Request
 from syft.service.response import SyftSuccess
 from syft.service.user.user_roles import ServiceRole
 
 
-def launch(node_type):
+def _launch(
+    server_type: ServerType,
+    association_request_auto_approval: bool = True,
+    port: int | str | None = None,
+):
     return sy.orchestra.launch(
         name=token_hex(8),
-        node_type=node_type,
+        server_type=server_type,
         dev_mode=True,
         reset=True,
-        local_db=True,
+        association_request_auto_approval=association_request_auto_approval,
+        port=port,
+        background_tasks=True,
     )
 
 
 @pytest.fixture
 def gateway():
-    node = launch(NodeType.GATEWAY)
-    yield node
-    node.python_node.cleanup()
-    node.land()
+    server = _launch(ServerType.GATEWAY)
+    yield server
+    server.python_server.cleanup()
+    server.land()
+
+
+@pytest.fixture(params=[True, False])
+def gateway_association_request_auto_approval(request: pytest.FixtureRequest):
+    server = _launch(
+        ServerType.GATEWAY, association_request_auto_approval=request.param
+    )
+    yield (request.param, server)
+    server.python_server.cleanup()
+    server.land()
 
 
 @pytest.fixture
-def domain():
-    node = launch(NodeType.DOMAIN)
-    yield node
-    node.python_node.cleanup()
-    node.land()
+def datasite():
+    server = _launch(ServerType.DATASITE)
+    yield server
+    server.python_server.cleanup()
+    server.land()
 
 
 @pytest.fixture
-def domain_2():
-    node = launch(NodeType.DOMAIN)
-    yield node
-    node.python_node.cleanup()
-    node.land()
+def datasite_2():
+    server = _launch(ServerType.DATASITE)
+    yield server
+    server.python_server.cleanup()
+    server.land()
 
 
 @pytest.fixture
 def enclave():
-    node = launch(NodeType.ENCLAVE)
-    yield node
-    node.python_node.cleanup()
-    node.land()
+    server = _launch(ServerType.ENCLAVE)
+    yield server
+    server.python_server.cleanup()
+    server.land()
 
 
-@pytest.mark.local_node
-def test_create_gateway_client(gateway):
-    client = gateway.client
+@pytest.fixture
+def gateway_webserver():
+    server = _launch(server_type=ServerType.GATEWAY, port="auto")
+    yield server
+    server.land()
+
+
+@pytest.fixture
+def datasite_webserver():
+    server = _launch(ServerType.DATASITE, port="auto")
+    yield server
+    server.land()
+
+
+@pytest.fixture
+def datasite_2_webserver():
+    server = _launch(ServerType.DATASITE, port="auto")
+    yield server
+    server.land()
+
+
+@pytest.fixture(scope="function")
+def set_network_json_env_var(gateway_webserver):
+    """Set the environment variable for the network registry JSON string."""
+    json_string = f"""
+        {{
+            "2.0.0": {{
+                "gateways": [
+                    {{
+                        "name": "{gateway_webserver.name}",
+                        "host_or_ip": "localhost",
+                        "protocol": "http",
+                        "port": "{gateway_webserver.port}",
+                        "admin_email": "support@openmined.org",
+                        "website": "https://www.openmined.org/",
+                        "slack": "https://slack.openmined.org/",
+                        "slack_channel": "#support"
+                    }}
+                ]
+            }}
+        }}
+    """
+    os.environ["NETWORK_REGISTRY_JSON"] = json_string
+    yield
+    # Clean up the environment variable after all tests in the module have run
+    del os.environ["NETWORK_REGISTRY_JSON"]
+
+
+@pytest.mark.local_server
+def test_create_gateway(
+    set_network_json_env_var,
+    gateway_webserver,
+    datasite_webserver,
+    datasite_2_webserver,
+):
+    assert isinstance(sy.gateways, sy.NetworkRegistry)
+    assert len(sy.gateways) == 1
+    assert len(sy.gateways.all_networks) == 1
+    assert sy.gateways.all_networks[0]["name"] == gateway_webserver.name
+    assert len(sy.gateways.online_networks) == 1
+    assert sy.gateways.online_networks[0]["name"] == gateway_webserver.name
+
+    gateway_client: GatewayClient = gateway_webserver.login(
+        email="info@openmined.org",
+        password="changethis",
+    )
+    res = gateway_client.settings.allow_association_request_auto_approval(enable=True)
+    assert isinstance(res, SyftSuccess)
+
+    datasite_client: DatasiteClient = datasite_webserver.login(
+        email="info@openmined.org",
+        password="changethis",
+    )
+    datasite_client_2: DatasiteClient = datasite_2_webserver.login(
+        email="info@openmined.org",
+        password="changethis",
+    )
+    result = datasite_client.connect_to_gateway(handle=gateway_webserver)
+    assert isinstance(result, SyftSuccess)
+    result = datasite_client_2.connect_to_gateway(handle=gateway_webserver)
+    assert isinstance(result, SyftSuccess)
+
+    time.sleep(PeerHealthCheckTask.repeat_time * 2 + 1)
+    connected_peers = gateway_client.api.services.network.get_all_peers()
+    assert len(connected_peers) == 2
+    for peer in connected_peers:
+        assert peer.ping_status == ServerPeerConnectionStatus.ACTIVE
+
+    # check the gateway client
+    client = gateway_webserver.client
     assert isinstance(client, GatewayClient)
-    assert client.metadata.node_type == NodeType.GATEWAY.value
+    assert client.metadata.server_type == ServerType.GATEWAY.value
 
 
-@pytest.mark.local_node
-def test_domain_connect_to_gateway(gateway, domain):
+@pytest.mark.local_server
+def test_datasite_connect_to_gateway(
+    gateway_association_request_auto_approval, datasite
+):
+    association_request_auto_approval, gateway = (
+        gateway_association_request_auto_approval
+    )
     gateway_client: GatewayClient = gateway.login(
         email="info@openmined.org",
         password="changethis",
     )
-    domain_client: DomainClient = domain.login(
+    datasite_client: DatasiteClient = datasite.login(
         email="info@openmined.org",
         password="changethis",
     )
 
-    result = domain_client.connect_to_gateway(handle=gateway)
-    assert isinstance(result, SyftSuccess)
+    result = datasite_client.connect_to_gateway(handle=gateway)
+
+    if association_request_auto_approval:
+        assert isinstance(result, SyftSuccess)
+    else:
+        assert isinstance(result, Request)
+        r = gateway_client.api.services.request.get_all()[-1].approve()
+        assert isinstance(r, SyftSuccess)
 
     # check priority
     all_peers = gateway_client.api.services.network.get_all_peers()
-    assert all_peers[0].node_routes[0].priority == 1
+    assert all_peers[0].server_routes[0].priority == 1
 
-    # Try via client approach
-    result_2 = domain_client.connect_to_gateway(via_client=gateway_client)
+    # Try again (via client approach)
+    result_2 = datasite_client.connect_to_gateway(via_client=gateway_client)
     assert isinstance(result_2, SyftSuccess)
 
-    assert len(domain_client.peers) == 1
+    assert len(datasite_client.peers) == 1
     assert len(gateway_client.peers) == 1
 
-    proxy_domain_client = gateway_client.peers[0]
-    domain_peer = domain_client.peers[0]
+    proxy_datasite_client = gateway_client.peers[0]
+    datasite_peer = datasite_client.peers[0]
 
-    assert isinstance(proxy_domain_client, DomainClient)
-    assert isinstance(domain_peer, NodePeer)
+    assert isinstance(proxy_datasite_client, DatasiteClient)
+    assert isinstance(datasite_peer, ServerPeer)
 
-    # Domain's peer is a gateway and vice-versa
-    assert domain_peer.node_type == NodeType.GATEWAY
+    # Datasite's peer is a gateway and vice-versa
+    assert datasite_peer.server_type == ServerType.GATEWAY
 
-    assert gateway_client.name == domain_peer.name
-    assert domain_client.name == proxy_domain_client.name
+    assert gateway_client.name == datasite_peer.name
+    assert datasite_client.name == proxy_datasite_client.name
 
-    assert len(gateway_client.domains) == 1
+    assert len(gateway_client.datasites) == 1
     assert len(gateway_client.enclaves) == 0
 
-    assert proxy_domain_client.metadata == domain_client.metadata
-    assert proxy_domain_client.user_role == ServiceRole.NONE
+    assert proxy_datasite_client.metadata == datasite_client.metadata
+    assert proxy_datasite_client.user_role == ServiceRole.NONE
 
-    domain_client = domain_client.login(
+    datasite_client = datasite_client.login(
         email="info@openmined.org", password="changethis"
     )
-    proxy_domain_client = proxy_domain_client.login(
+    proxy_datasite_client = proxy_datasite_client.login(
         email="info@openmined.org", password="changethis"
     )
 
-    assert proxy_domain_client.logged_in_user == "info@openmined.org"
-    assert proxy_domain_client.user_role == ServiceRole.ADMIN
-    assert proxy_domain_client.credentials == domain_client.credentials
+    assert proxy_datasite_client.logged_in_user == "info@openmined.org"
+    assert proxy_datasite_client.user_role == ServiceRole.ADMIN
+    assert proxy_datasite_client.credentials == datasite_client.credentials
     assert (
-        proxy_domain_client.api.endpoints.keys() == domain_client.api.endpoints.keys()
+        proxy_datasite_client.api.endpoints.keys()
+        == datasite_client.api.endpoints.keys()
     )
 
     # check priority
     all_peers = gateway_client.api.services.network.get_all_peers()
-    assert all_peers[0].node_routes[0].priority == 2
+    assert all_peers[0].server_routes[0].priority == 1
 
 
-@pytest.mark.local_node
-def test_domain_connect_to_gateway_routes_priority(gateway, domain, domain_2) -> None:
+@pytest.mark.local_server
+def test_datasite_connect_to_gateway_routes_priority(
+    gateway, datasite, datasite_2
+) -> None:
     """
-    A test for routes' priority (PythonNodeRoute)
-    TODO: Add a similar test for HTTPNodeRoute
+    A test for routes' priority (PythonServerRoute)
     """
     gateway_client: GatewayClient = gateway.login(
         email="info@openmined.org",
         password="changethis",
     )
-    domain_client: DomainClient = domain.login(
+    datasite_client: DatasiteClient = datasite.login(
         email="info@openmined.org",
         password="changethis",
     )
 
-    result = domain_client.connect_to_gateway(handle=gateway)
+    result = datasite_client.connect_to_gateway(handle=gateway)
     assert isinstance(result, SyftSuccess)
 
     all_peers = gateway_client.api.services.network.get_all_peers()
     assert len(all_peers) == 1
-    domain_1_routes = all_peers[0].node_routes
-    assert domain_1_routes[0].priority == 1
+    datasite_1_routes = all_peers[0].server_routes
+    assert datasite_1_routes[0].priority == 1
 
-    # reconnect to the gateway. The route's priority should be increased by 1
-    result = domain_client.connect_to_gateway(via_client=gateway_client)
+    # reconnect to the gateway
+    result = datasite_client.connect_to_gateway(via_client=gateway_client)
     assert isinstance(result, SyftSuccess)
     all_peers = gateway_client.api.services.network.get_all_peers()
     assert len(all_peers) == 1
-    domain_1_routes = all_peers[0].node_routes
-    assert domain_1_routes[0].priority == 2
+    datasite_1_routes = all_peers[0].server_routes
+    assert datasite_1_routes[0].priority == 1
 
-    # another domain client connects to the gateway
-    domain_client_2: DomainClient = domain_2.login(
+    # another datasite client connects to the gateway
+    datasite_client_2: DatasiteClient = datasite_2.login(
         email="info@openmined.org",
         password="changethis",
     )
-    result = domain_client_2.connect_to_gateway(handle=gateway)
+    result = datasite_client_2.connect_to_gateway(handle=gateway)
     assert isinstance(result, SyftSuccess)
 
     all_peers = gateway_client.api.services.network.get_all_peers()
     assert len(all_peers) == 2
     for peer in all_peers:
-        if peer.name == domain_client.metadata.name:
-            assert peer.node_routes[0].priority == 2
-        if peer.name == domain_client_2.metadata.name:
-            assert peer.node_routes[0].priority == 1
+        assert peer.server_routes[0].priority == 1
 
 
-@pytest.mark.local_node
+@pytest.mark.local_server
 def test_enclave_connect_to_gateway(faker: Faker, gateway, enclave):
     gateway_client = gateway.client
     enclave_client: EnclaveClient = enclave.client
@@ -194,15 +313,15 @@ def test_enclave_connect_to_gateway(faker: Faker, gateway, enclave):
     enclave_peer = enclave_client.peers[0]
 
     assert isinstance(proxy_enclave_client, EnclaveClient)
-    assert isinstance(enclave_peer, NodePeer)
+    assert isinstance(enclave_peer, ServerPeer)
 
     assert gateway_client.name == enclave_peer.name
     assert enclave_client.name == proxy_enclave_client.name
 
-    # Domain's peer is a gateway and vice-versa
-    assert enclave_peer.node_type == NodeType.GATEWAY
+    # Datasite's peer is a gateway and vice-versa
+    assert enclave_peer.server_type == ServerType.GATEWAY
 
-    assert len(gateway_client.domains) == 0
+    assert len(gateway_client.datasites) == 0
     assert len(gateway_client.enclaves) == 1
 
     assert proxy_enclave_client.metadata == enclave_client.metadata
@@ -228,3 +347,40 @@ def test_enclave_connect_to_gateway(faker: Faker, gateway, enclave):
     assert (
         proxy_enclave_client.api.endpoints.keys() == enclave_client.api.endpoints.keys()
     )
+
+
+@pytest.mark.local_server
+@pytest.mark.parametrize(
+    "gateway_association_request_auto_approval", [False], indirect=True
+)
+def test_repeated_association_requests_peers_health_check(
+    gateway_association_request_auto_approval, datasite
+):
+    _, gateway = gateway_association_request_auto_approval
+    gateway_client: GatewayClient = gateway.login(
+        email="info@openmined.org",
+        password="changethis",
+    )
+    datasite_client: DatasiteClient = datasite.login(
+        email="info@openmined.org",
+        password="changethis",
+    )
+
+    result = datasite_client.connect_to_gateway(handle=gateway)
+    assert isinstance(result, Request)
+
+    result = datasite_client.connect_to_gateway(handle=gateway)
+    assert isinstance(result, Request)
+
+    r = gateway_client.api.services.request.get_all()[-1].approve()
+    assert isinstance(r, SyftSuccess)
+
+    result = datasite_client.connect_to_gateway(handle=gateway)
+    assert isinstance(result, SyftSuccess)
+
+    # the gateway client checks that the peer is associated
+    res = gateway_client.api.services.network.check_peer_association(
+        peer_id=datasite_client.id
+    )
+    assert isinstance(res, ServerPeerAssociationStatus)
+    assert res.value == "PEER_ASSOCIATED"

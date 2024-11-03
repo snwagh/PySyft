@@ -2,10 +2,10 @@
 import pytest
 
 # syft absolute
-from syft.node.credentials import UserLoginCredentials
-from syft.node.worker import Worker
+from syft.server.credentials import UserLoginCredentials
+from syft.server.worker import Worker
 from syft.service.context import AuthedServiceContext
-from syft.service.context import NodeServiceContext
+from syft.service.context import ServerServiceContext
 from syft.service.context import UnauthedServiceContext
 from syft.service.user.user import User
 from syft.service.user.user import UserCreate
@@ -16,7 +16,6 @@ from syft.service.user.user import UserView
 from syft.service.user.user_roles import ServiceRole
 from syft.service.user.user_service import UserService
 from syft.service.user.user_stash import UserStash
-from syft.store.document_store import DocumentStore
 
 
 @pytest.fixture
@@ -107,23 +106,23 @@ def guest_user_search(guest_user) -> UserSearch:
 
 
 @pytest.fixture
-def user_stash(document_store: DocumentStore) -> UserStash:
+def user_stash(document_store) -> UserStash:
     yield UserStash(store=document_store)
 
 
 @pytest.fixture
-def user_service(document_store: DocumentStore):
+def user_service(document_store):
     yield UserService(store=document_store)
 
 
 @pytest.fixture
 def authed_context(admin_user: User, worker: Worker) -> AuthedServiceContext:
-    yield AuthedServiceContext(credentials=admin_user.verify_key, node=worker)
+    yield AuthedServiceContext(credentials=admin_user.verify_key, server=worker)
 
 
 @pytest.fixture
-def node_context(worker: Worker) -> NodeServiceContext:
-    yield NodeServiceContext(node=worker)
+def server_context(worker: Worker) -> ServerServiceContext:
+    yield ServerServiceContext(server=worker)
 
 
 @pytest.fixture
@@ -133,4 +132,4 @@ def unauthed_context(
     login_credentials = UserLoginCredentials(
         email=guest_create_user.email, password=guest_create_user.password
     )
-    yield UnauthedServiceContext(login_credentials=login_credentials, node=worker)
+    yield UnauthedServiceContext(login_credentials=login_credentials, server=worker)

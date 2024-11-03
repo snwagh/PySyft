@@ -1,17 +1,19 @@
 # stdlib
 from collections import OrderedDict
-from textwrap import dedent
+import sys
 
 # third party
 import numpy as np
+import pytest
 
 # syft absolute
 import syft as sy
 from syft.client.api import APIRegistry
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")
 def test_local_execution(worker):
-    root_domain_client = worker.root_client
+    root_datasite_client = worker.root_client
     dataset = sy.Dataset(
         name="local_test",
         asset_list=[
@@ -22,15 +24,15 @@ def test_local_execution(worker):
             )
         ],
     )
-    root_domain_client.upload_dataset(dataset)
-    asset = root_domain_client.datasets[0].assets[0]
+    root_datasite_client.upload_dataset(dataset)
+    asset = root_datasite_client.datasets[0].assets[0]
 
     APIRegistry.__api_registry__ = OrderedDict()
 
     APIRegistry.set_api_for(
-        node_uid=worker.id,
-        user_verify_key=root_domain_client.verify_key,
-        api=root_domain_client.api,
+        server_uid=worker.id,
+        user_verify_key=root_datasite_client.verify_key,
+        api=root_datasite_client.api,
     )
 
     @sy.syft_function(
@@ -40,8 +42,9 @@ def test_local_execution(worker):
     def my_func(x):
         return x + 1
 
-    my_func.code = dedent(my_func.code)
-
     # time.sleep(10)
-    local_res = my_func(x=asset, time_alive=1)
+    local_res = my_func(
+        x=asset,
+        time_alive=1,
+    )
     assert (local_res == np.array([2, 2, 2])).all()

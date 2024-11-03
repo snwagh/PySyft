@@ -1,22 +1,30 @@
+# future
+from __future__ import annotations
+
 # stdlib
+from collections import OrderedDict
 from collections import defaultdict
 from collections.abc import Callable
+from collections.abc import Iterable
 from copy import deepcopy
+import functools
 from functools import partial
+from functools import reduce
 import inspect
 from inspect import Parameter
+import logging
+import operator
+import types
+import typing
 from typing import Any
 from typing import TYPE_CHECKING
-from typing import Union
 
 # third party
-from result import Ok
-from result import OkErr
+from pydantic import ValidationError
 from typing_extensions import Self
 
 # relative
-from ..abstract_node import AbstractNode
-from ..node.credentials import SyftVerifyKey
+from ..abstract_server import AbstractServer
 from ..protocol.data_protocol import migrate_args_and_kwargs
 from ..serde.lib_permissions import CMPCRUDPermission
 from ..serde.lib_permissions import CMPPermission
@@ -28,19 +36,28 @@ from ..serde.serializable import serializable
 from ..serde.signature import Signature
 from ..serde.signature import signature_remove_context
 from ..serde.signature import signature_remove_self
+from ..server.credentials import SyftVerifyKey
+from ..store.db.stash import ObjectStash
 from ..store.linked_obj import LinkedObject
+from ..types.errors import SyftException
+from ..types.result import as_result
+from ..types.syft_metaclass import Empty
+from ..types.syft_metaclass import EmptyType
+from ..types.syft_object import EXCLUDED_FROM_SIGNATURE
+from ..types.syft_object import SYFT_OBJECT_VERSION_1
 from ..types.syft_object import SYFT_OBJECT_VERSION_2
 from ..types.syft_object import SyftBaseObject
 from ..types.syft_object import SyftObject
 from ..types.syft_object import attach_attribute_to_syft_object
 from ..types.uid import UID
+from ..util.telemetry import instrument
 from .context import AuthedServiceContext
 from .context import ChangeContext
-from .response import SyftError
 from .user.user_roles import DATA_OWNER_ROLE_LEVEL
 from .user.user_roles import ServiceRole
-from .veilid import VEILID_ENABLED
 from .warnings import APIEndpointWarning
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # relative
@@ -51,34 +68,53 @@ SERVICE_TO_TYPES: defaultdict = defaultdict(set)
 
 
 class AbstractService:
-    node: AbstractNode
-    node_uid: UID
+    server: AbstractServer
+    server_uid: UID
+    stash: ObjectStash
 
+    @as_result(SyftException)
     def resolve_link(
         self,
         context: AuthedServiceContext | ChangeContext | Any,
         linked_obj: LinkedObject,
-    ) -> Any | SyftError:
+    ) -> Any:
         if isinstance(context, AuthedServiceContext):
             credentials = context.credentials
         elif isinstance(context, ChangeContext):
             credentials = context.approving_user_credentials
         else:
-            return SyftError(message="wrong context passed")
+            raise SyftException(public_message="Wrong context passed")
 
-        obj = self.stash.get_by_uid(credentials, uid=linked_obj.object_uid)
-        if isinstance(obj, OkErr) and obj.is_ok():
-            obj = obj.ok()
-        if hasattr(obj, "node_uid"):
-            if context.node is None:
-                return SyftError(message=f"context {context}'s node is None")
-            obj.node_uid = context.node.id
-        if not isinstance(obj, OkErr):
-            obj = Ok(obj)
+        # TODO: Add stash to AbstractService?
+        obj = self.stash.get_by_uid(credentials, uid=linked_obj.object_uid).unwrap()  # type: ignore
+
+        if hasattr(obj, "server_uid"):
+            if context.server is None:
+                raise SyftException(
+                    public_message=f"The context '{context}' server is None"
+                )
+            obj.server_uid = context.server.id
+
         return obj
 
+    # TODO: Delete?
     def get_all(*arg: Any, **kwargs: Any) -> Any:
         pass
+
+
+@serializable()
+class BaseConfigV1(SyftBaseObject):
+    __canonical_name__ = "BaseConfig"
+    __version__ = SYFT_OBJECT_VERSION_1
+
+    public_path: str
+    private_path: str
+    public_name: str
+    method_name: str
+    doc_string: str | None = None
+    signature: Signature | None = None
+    is_from_lib: bool = False
+    warning: APIEndpointWarning | None = None
 
 
 @serializable()
@@ -94,11 +130,23 @@ class BaseConfig(SyftBaseObject):
     signature: Signature | None = None
     is_from_lib: bool = False
     warning: APIEndpointWarning | None = None
+    unwrap_on_success: bool = True
+
+
+@serializable()
+class ServiceConfigV1(BaseConfigV1):
+    __canonical_name__ = "ServiceConfig"
+    __version__ = SYFT_OBJECT_VERSION_1
+
+    permissions: list
+    roles: list[ServiceRole]
 
 
 @serializable()
 class ServiceConfig(BaseConfig):
     __canonical_name__ = "ServiceConfig"
+    __version__ = SYFT_OBJECT_VERSION_2
+
     permissions: list
     roles: list[ServiceRole]
 
@@ -107,8 +155,16 @@ class ServiceConfig(BaseConfig):
 
 
 @serializable()
+class LibConfigV1(BaseConfigV1):
+    __canonical_name__ = "LibConfig"
+    __version__ = SYFT_OBJECT_VERSION_1
+    permissions: set[CMPPermission]
+
+
+@serializable()
 class LibConfig(BaseConfig):
     __canonical_name__ = "LibConfig"
+    __version__ = SYFT_OBJECT_VERSION_2
     permissions: set[CMPPermission]
 
     def has_permission(self, credentials: SyftVerifyKey) -> bool:
@@ -228,19 +284,14 @@ def register_lib_obj(lib_obj: CMPBase) -> None:
             LibConfigRegistry.register(lib_config)
 
 
-# NOTE: Currently we disable adding library enpoints like numpy, torch when veilid is enabled
-# This is because the /api endpoint which return SyftAPI along with the lib enpoints exceeds
-# 2 MB . But veilid has a limit of 32 KB for sending and receiving message.
-# This would be fixed, when chunking is implemented at veilid core.
-if not VEILID_ENABLED:
-    # hacky, prevent circular imports
-    for lib_obj in action_execute_registry_libs.flatten():
-        # # for functions
-        # func_name = func.__name__
-        # # for classes
-        # func_name = path.split(".")[-1]
-        if isinstance(lib_obj, CMPFunction) or isinstance(lib_obj, CMPClass):
-            register_lib_obj(lib_obj)
+# hacky, prevent circular imports
+for lib_obj in action_execute_registry_libs.flatten():
+    # # for functions
+    # func_name = func.__name__
+    # # for classes
+    # func_name = path.split(".")[-1]
+    if isinstance(lib_obj, CMPFunction) or isinstance(lib_obj, CMPClass):
+        register_lib_obj(lib_obj)
 
 
 def deconstruct_param(param: inspect.Parameter) -> dict[str, Any]:
@@ -258,16 +309,57 @@ def deconstruct_param(param: inspect.Parameter) -> dict[str, Any]:
 
 
 def types_for_autosplat(signature: Signature, autosplat: list[str]) -> dict[str, type]:
-    autosplat_types = {}
-    for k, v in signature.parameters.items():
-        if k in autosplat:
-            autosplat_types[k] = v.annotation
-    return autosplat_types
+    return {k: v.annotation for k, v in signature.parameters.items() if k in autosplat}
+
+
+def _check_empty_union(x: Any) -> bool:
+    return isinstance(
+        x, typing._UnionGenericAlias | types.UnionType
+    ) and EmptyType in typing.get_args(x)
+
+
+def _check_empty_parameter(p: Parameter) -> bool:
+    return _check_empty_union(p.annotation) and p.default is Empty
+
+
+def _make_union_type(args: Iterable) -> types.UnionType:
+    return reduce(operator.or_, args)
+
+
+def _replace_empty_parameter(p: Parameter) -> Parameter:
+    return Parameter(
+        name=p.name,
+        default="optional",
+        annotation=_make_union_type(
+            t for t in typing.get_args(p.annotation) if t is not EmptyType
+        ),
+        kind=p.kind,
+    )
+
+
+def _format_signature(s: inspect.Signature) -> inspect.Signature:
+    params = (
+        (_replace_empty_parameter(p) if _check_empty_parameter(p) else p)
+        for p in s.parameters.values()
+    )
+
+    return inspect.Signature(
+        parameters=params,
+        return_annotation=inspect.Signature.empty,
+    )
+
+
+_SIGNATURE_ERROR_MESSAGE = "Please provide the correct arguments to the method according to the following signature:"
+
+
+def _signature_error_message(s: inspect.Signature) -> str:
+    return f"{_SIGNATURE_ERROR_MESSAGE}\n{s}"
 
 
 def reconstruct_args_kwargs(
     signature: Signature,
     autosplat: list[str],
+    expanded_signature: Signature,
     args: tuple[Any, ...],
     kwargs: dict[Any, str],
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -280,10 +372,26 @@ def reconstruct_args_kwargs(
         for key in keys:
             if key in kwargs:
                 init_kwargs[key] = kwargs.pop(key)
-        autosplat_objs[autosplat_key] = autosplat_type(**init_kwargs)
+        try:
+            autosplat_objs[autosplat_key] = autosplat_type(**init_kwargs)
+        except ValidationError:
+            raise TypeError(
+                f"Invalid argument(s) provided. "
+                f"{_signature_error_message(_format_signature(expanded_signature))}"
+            )
+
+    autosplat_parameters = OrderedDict(
+        (param_key, param)
+        for param_key, param in signature.parameters.items()
+        if param_key in autosplat_objs
+    )
 
     final_kwargs = {}
-    for param_key, param in signature.parameters.items():
+    for key in kwargs:
+        if key not in autosplat_parameters:
+            final_kwargs[key] = kwargs[key]
+
+    for param_key, param in autosplat_parameters.items():
         if param_key in kwargs:
             final_kwargs[param_key] = kwargs[param_key]
         elif param_key in autosplat_objs:
@@ -291,7 +399,14 @@ def reconstruct_args_kwargs(
         elif not isinstance(param.default, type(Parameter.empty)):
             final_kwargs[param_key] = param.default
         else:
-            raise Exception(f"Missing {param_key} not in kwargs.")
+            raise TypeError(
+                f"Missing argument {param_key}. "
+                f"{_signature_error_message(_format_signature(expanded_signature))}"
+            )
+
+    if "context" in kwargs:
+        final_kwargs["context"] = kwargs["context"]
+
     return (args, final_kwargs)
 
 
@@ -314,7 +429,7 @@ def expand_signature(signature: Signature, autosplat: list[str]) -> Signature:
 
     # Reorder the parameter based on if they have default value or not
     new_params = sorted(
-        new_mapping.values(),
+        (v for k, v in new_mapping.items() if k not in EXCLUDED_FROM_SIGNATURE),
         key=lambda param: param.default is param.empty,
         reverse=True,
     )
@@ -333,6 +448,7 @@ def service_method(
     roles: list[ServiceRole] | None = None,
     autosplat: list[str] | None = None,
     warning: APIEndpointWarning | None = None,
+    unwrap_on_success: bool = True,
 ) -> Callable:
     if roles is None or len(roles) == 0:
         # TODO: this is dangerous, we probably want to be more conservative
@@ -348,6 +464,14 @@ def service_method(
 
         input_signature = deepcopy(signature)
 
+        if autosplat is not None and len(autosplat) > 0:
+            signature = expand_signature(signature=input_signature, autosplat=autosplat)
+
+        @instrument(  # type: ignore
+            span_name=f"service_method::{_path}",
+            attributes={"service.name": name, "service.path": path},
+        )
+        @functools.wraps(func)
         def _decorator(self: Any, *args: Any, **kwargs: Any) -> Callable:
             communication_protocol = kwargs.pop("communication_protocol", None)
 
@@ -359,6 +483,7 @@ def service_method(
                 args, kwargs = reconstruct_args_kwargs(
                     signature=input_signature,
                     autosplat=autosplat,
+                    expanded_signature=signature,
                     args=args,
                     kwargs=kwargs,
                 )
@@ -373,15 +498,11 @@ def service_method(
             context = kwargs.get("context", None)
             context = args[0] if context is None else context
             attrs_to_attach = {
-                "syft_node_location": context.node.id,
+                "syft_server_location": context.server.id,
                 "syft_client_verify_key": context.credentials,
             }
-            return attach_attribute_to_syft_object(
-                result=result, attr_dict=attrs_to_attach
-            )
-
-        if autosplat is not None and len(autosplat) > 0:
-            signature = expand_signature(signature=input_signature, autosplat=autosplat)
+            attach_attribute_to_syft_object(result=result, attr_dict=attrs_to_attach)
+            return result
 
         config = ServiceConfig(
             public_path=_path if path is None else path,
@@ -393,6 +514,7 @@ def service_method(
             roles=roles,
             permissions=["Guest"],
             warning=warning,
+            unwrap_on_success=unwrap_on_success,
         )
         ServiceConfigRegistry.register(config)
 
@@ -413,7 +535,7 @@ class SyftServiceRegistry:
             cls.__object_version_registry__[mapping_string] = cls
 
     @classmethod
-    def versioned_class(cls, name: str, version: int) -> type["SyftObject"] | None:
+    def versioned_class(cls, name: str, version: int) -> type[SyftObject] | None:
         mapping_string = f"{name}_{version}"
         if mapping_string not in cls.__object_version_registry__:
             return None
@@ -433,7 +555,7 @@ class SyftServiceRegistry:
 
     @classmethod
     def get_transform(
-        cls, type_from: type["SyftObject"], type_to: type["SyftObject"]
+        cls, type_from: type[SyftObject], type_to: type[SyftObject]
     ) -> Callable:
         klass_from = type_from.__canonical_name__
         version_from = type_from.__version__
@@ -445,52 +567,52 @@ class SyftServiceRegistry:
 
 def from_api_or_context(
     func_or_path: str,
-    syft_node_location: UID | None = None,
+    syft_server_location: UID | None = None,
     syft_client_verify_key: SyftVerifyKey | None = None,
-) -> Union["APIModule", SyftError, partial] | None:
+) -> APIModule | partial | None:
     # relative
     from ..client.api import APIRegistry
-    from ..node.node import AuthNodeContextRegistry
+    from ..server.server import AuthServerContextRegistry
 
     if callable(func_or_path):
         func_or_path = func_or_path.__qualname__
 
-    if not (syft_node_location and syft_client_verify_key):
+    if not (syft_server_location and syft_client_verify_key):
         return None
 
     api = APIRegistry.api_for(
-        node_uid=syft_node_location,
+        server_uid=syft_server_location,
         user_verify_key=syft_client_verify_key,
     )
-    if api is not None:
-        service_method = api.services
+    if api.is_ok():
+        service_method = api.unwrap().services
         for path in func_or_path.split("."):
             service_method = getattr(service_method, path)
         return service_method
 
-    node_context = AuthNodeContextRegistry.auth_context_for_user(
-        node_uid=syft_node_location,
+    server_context = AuthServerContextRegistry.auth_context_for_user(
+        server_uid=syft_server_location,
         user_verify_key=syft_client_verify_key,
     )
-    if node_context is not None and node_context.node is not None:
+    if server_context is not None and server_context.server is not None:
         user_config_registry = UserServiceConfigRegistry.from_role(
-            node_context.role,
+            server_context.role,
         )
         if func_or_path not in user_config_registry:
             if ServiceConfigRegistry.path_exists(func_or_path):
-                return SyftError(
-                    message=f"As a `{node_context.role}` you have has no access to: {func_or_path}"
+                raise SyftException(
+                    public_message=f"As a `{server_context.role}` you have has no access to: {func_or_path}"
                 )
             else:
-                return SyftError(
-                    message=f"API call not in registered services: {func_or_path}"
+                raise SyftException(
+                    public_message=f"API call not in registered services: {func_or_path}"
                 )
 
         _private_api_path = user_config_registry.private_path_for(func_or_path)
-        service_method = node_context.node.get_service_method(
+        service_method = server_context.server.get_service_method(
             _private_api_path,
         )
-        return partial(service_method, node_context)
+        return partial(service_method, server_context)
     else:
-        print("Could not get method from api or context")
+        logger.error("Could not get method from api or context")
         return None

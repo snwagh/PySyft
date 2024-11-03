@@ -1,13 +1,16 @@
 # stdlib
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 
 # third party
 import pytest
 
 # syft absolute
+import syft as sy
 from syft.service.job.job_stash import Job
 from syft.service.job.job_stash import JobStatus
+from syft.types.errors import SyftException
 from syft.types.uid import UID
 
 
@@ -30,10 +33,10 @@ from syft.types.uid import UID
 def test_eta_string(current_iter, n_iters, status, creation_time_delta, expected):
     job = Job(
         id=UID(),
-        node_uid=UID(),
+        server_uid=UID(),
         n_iters=n_iters,
         current_iter=current_iter,
-        creation_time=(datetime.now() - creation_time_delta).isoformat(),
+        creation_time=(datetime.now(tz=timezone.utc) - creation_time_delta).isoformat(),
         status=status,
     )
 
@@ -43,3 +46,19 @@ def test_eta_string(current_iter, n_iters, status, creation_time_delta, expected
         assert job.eta_string is not None
         assert isinstance(job.eta_string, str)
         assert expected in job.eta_string
+
+
+def test_job_no_consumer(worker):
+    client = worker.root_client
+    ds_client = worker.guest_client
+
+    @sy.syft_function_single_use()
+    def process_all(): ...
+
+    _ = ds_client.code.request_code_execution(process_all)
+    job = client.code.process_all(blocking=False)
+
+    with pytest.raises(SyftException) as exc:
+        job.wait()
+
+    assert "has no workers" in exc.value.public_message

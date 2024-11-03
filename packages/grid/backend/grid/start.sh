@@ -1,45 +1,61 @@
 #! /usr/bin/env bash
 set -e
 
-echo "Running start.sh with RELEASE=${RELEASE} and $(id)"
-export GEVENT_MONKEYPATCH="False"
+echo "Running Syft with RELEASE=${RELEASE}"
 
 APP_MODULE=grid.main:app
 LOG_LEVEL=${LOG_LEVEL:-info}
 HOST=${HOST:-0.0.0.0}
 PORT=${PORT:-80}
-NODE_TYPE=${NODE_TYPE:-domain}
 APPDIR=${APPDIR:-$HOME/app}
-
 RELOAD=""
-DEBUG_CMD=""
+ROOT_PROC=""
 
-# For debugging permissions
-ls -lisa $HOME/data
-ls -lisa $APPDIR/syft/
-ls -lisa $APPDIR/grid/
+export CREDENTIALS_PATH=${CREDENTIALS_PATH:-$HOME/data/creds/credentials.json}
+export SERVER_PRIVATE_KEY=$(python $APPDIR/grid/bootstrap.py --private_key)
+export SERVER_UID=$(python $APPDIR/grid/bootstrap.py --uid)
 
 if [[ ${DEV_MODE} == "True" ]];
 then
-    echo "DEV_MODE Enabled"
+    echo "Hot-reload Enabled"
     RELOAD="--reload"
-    pip install --user -e "$APPDIR/syft[telemetry,data_science]"
 fi
 
 # only set by kubernetes to avoid conflict with docker tests
 if [[ ${DEBUGGER_ENABLED} == "True" ]];
 then
-    pip install --user debugpy
-    DEBUG_CMD="python -m debugpy --listen 0.0.0.0:5678 -m"
+    echo "Debugger Enabled"
+    uv pip install debugpy
+    ROOT_PROC="python -m debugpy --listen 0.0.0.0:5678 -m"
 fi
 
-set +e
-export NODE_PRIVATE_KEY=$(python $APPDIR/grid/bootstrap.py --private_key)
-export NODE_UID=$(python $APPDIR/grid/bootstrap.py --uid)
-export NODE_TYPE=$NODE_TYPE
-set -e
+if [[ ${TRACING} == "true" ]];
+then
+    # TODO: Polish these values up
+    DEPLOYMENT_ENV="$SERVER_TYPE-$SERVER_SIDE_TYPE"
+    RESOURCE_ATTRS=(
+        "deployment.environment=$DEPLOYMENT_ENV"
+        "service.namespace=$DEPLOYMENT_ENV"
+        "service.instance.id=$SERVER_UID"
+        "k8s.pod.name=${K8S_POD_NAME:-"none"}"
+        "k8s.namespace.name=${K8S_NAMESPACE:"none"}"
+        "syft.server.uid=$SERVER_UID"
+        "syft.server.type=$SERVER_TYPE"
+        "syft.server.side.type=$SERVER_SIDE_TYPE"
+    )
 
-echo "NODE_UID=$NODE_UID"
-echo "NODE_TYPE=$NODE_TYPE"
+    # environ is always prefixed with the server type
+    export OTEL_SERVICE_NAME="${DEPLOYMENT_ENV}-${OTEL_SERVICE_NAME:-"backend"}"
+    export OTEL_RESOURCE_ATTRIBUTES=$(IFS=, ; echo "${RESOURCE_ATTRS[*]}")
 
-exec $DEBUG_CMD uvicorn $RELOAD --host $HOST --port $PORT --log-level $LOG_LEVEL "$APP_MODULE"
+    echo "OpenTelemetry Enabled"
+    env | grep OTEL_
+else
+    echo "OpenTelemetry Disabled"
+fi
+
+echo "SERVER_UID=$SERVER_UID"
+echo "SERVER_TYPE=$SERVER_TYPE"
+echo "SERVER_SIDE_TYPE=$SERVER_SIDE_TYPE"
+
+exec $ROOT_PROC uvicorn $RELOAD --host $HOST --port $PORT --log-config=$APPDIR/grid/logging.yaml "$APP_MODULE"

@@ -1,5 +1,5 @@
 # stdlib
-import json
+from functools import cache
 import os
 from pathlib import Path
 from secrets import token_hex
@@ -7,43 +7,29 @@ import shutil
 import sys
 from tempfile import gettempdir
 from unittest import mock
+from uuid import uuid4
 
 # third party
 from faker import Faker
-from pymongo import MongoClient
+import numpy as np
 import pytest
 
 # syft absolute
 import syft as sy
-from syft.client.domain_client import DomainClient
-from syft.node.worker import Worker
+from syft import Dataset
+from syft.abstract_server import ServerSideType
+from syft.client.datasite_client import DatasiteClient
 from syft.protocol.data_protocol import get_data_protocol
 from syft.protocol.data_protocol import protocol_release_dir
 from syft.protocol.data_protocol import stage_protocol_changes
-
-# relative
-from .syft.stores.store_fixtures_test import dict_action_store  # noqa: F401
-from .syft.stores.store_fixtures_test import dict_document_store  # noqa: F401
-from .syft.stores.store_fixtures_test import dict_queue_stash  # noqa: F401
-from .syft.stores.store_fixtures_test import dict_store_partition  # noqa: F401
-from .syft.stores.store_fixtures_test import mongo_action_store  # noqa: F401
-from .syft.stores.store_fixtures_test import mongo_document_store  # noqa: F401
-from .syft.stores.store_fixtures_test import mongo_queue_stash  # noqa: F401
-from .syft.stores.store_fixtures_test import mongo_store_partition  # noqa: F401
-from .syft.stores.store_fixtures_test import sqlite_action_store  # noqa: F401
-from .syft.stores.store_fixtures_test import sqlite_document_store  # noqa: F401
-from .syft.stores.store_fixtures_test import sqlite_queue_stash  # noqa: F401
-from .syft.stores.store_fixtures_test import sqlite_store_partition  # noqa: F401
-from .syft.stores.store_fixtures_test import sqlite_workspace  # noqa: F401
-from .utils.mongodb import start_mongo_server
-from .utils.mongodb import stop_mongo_server
-from .utils.xdist_state import SharedState
+from syft.server.worker import Worker
+from syft.service.queue.queue_stash import QueueStash
+from syft.service.user import user
 
 
 def patch_protocol_file(filepath: Path):
     dp = get_data_protocol()
-    original_protocol = dp.read_json(dp.file_path)
-    filepath.write_text(json.dumps(original_protocol))
+    shutil.copyfile(src=dp.file_path, dst=filepath)
 
 
 def remove_file(filepath: Path):
@@ -94,8 +80,10 @@ def protocol_file():
     protocol_dir = sy.SYFT_PATH / "protocol"
     file_path = protocol_dir / f"{random_name}.json"
     patch_protocol_file(filepath=file_path)
-    yield file_path
-    remove_file(filepath=file_path)
+    try:
+        yield file_path
+    finally:
+        remove_file(file_path)
 
 
 @pytest.fixture(autouse=True)
@@ -108,14 +96,15 @@ def stage_protocol(protocol_file: Path):
         stage_protocol_changes()
         # bump_protocol_version()
         yield dp.protocol_history
-        dp.revert_latest_protocol()
+        dp.reset_dev_protocol()
         dp.save_history(dp.protocol_history)
 
         # Cleanup release dir, remove unused released files
-        for _file_path in protocol_release_dir().iterdir():
-            for version in dp.read_json(_file_path):
-                if version not in dp.protocol_history.keys():
-                    _file_path.unlink()
+        if os.path.exists(protocol_release_dir()):
+            for _file_path in protocol_release_dir().iterdir():
+                for version in dp.read_json(_file_path):
+                    if version not in dp.protocol_history.keys():
+                        _file_path.unlink()
 
 
 @pytest.fixture
@@ -125,14 +114,51 @@ def faker():
 
 @pytest.fixture(scope="function")
 def worker() -> Worker:
-    worker = sy.Worker.named(name=token_hex(8))
+    """
+    NOTE in-memory sqlite is not shared between connections, so:
+    - using 2 workers (high/low) will not share a db
+    - re-using a connection (e.g. for a Job worker) will not share a db
+    """
+    worker = sy.Worker.named(name=token_hex(16), db_url="sqlite://")
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture(scope="function")
+def second_worker() -> Worker:
+    # Used in server syncing tests
+    worker = sy.Worker.named(name=uuid4().hex, db_url="sqlite://")
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture(scope="function")
+def high_worker() -> Worker:
+    worker = sy.Worker.named(
+        name=token_hex(8), server_side_type=ServerSideType.HIGH_SIDE, db_url="sqlite://"
+    )
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture(scope="function")
+def low_worker() -> Worker:
+    worker = sy.Worker.named(
+        name=token_hex(8),
+        server_side_type=ServerSideType.LOW_SIDE,
+        dev_mode=True,
+        db_url="sqlite://",
+    )
     yield worker
     worker.cleanup()
     del worker
 
 
 @pytest.fixture
-def root_domain_client(worker) -> DomainClient:
+def root_datasite_client(worker) -> DatasiteClient:
     yield worker.root_client
 
 
@@ -142,7 +168,7 @@ def root_verify_key(worker):
 
 
 @pytest.fixture
-def guest_client(worker) -> DomainClient:
+def guest_client(worker) -> DatasiteClient:
     yield worker.guest_client
 
 
@@ -152,14 +178,34 @@ def guest_verify_key(worker):
 
 
 @pytest.fixture
-def guest_domain_client(root_domain_client) -> DomainClient:
-    yield root_domain_client.guest()
+def guest_datasite_client(root_datasite_client) -> DatasiteClient:
+    yield root_datasite_client.guest()
+
+
+@pytest.fixture
+def ds_client(
+    faker: Faker, root_datasite_client: DatasiteClient, guest_client: DatasiteClient
+):
+    guest_email = faker.email()
+    password = "mysecretpassword"
+    root_datasite_client.register(
+        name=faker.name(),
+        email=guest_email,
+        password=password,
+        password_verify=password,
+    )
+    ds_client = guest_client.login(email=guest_email, password=password)
+    yield ds_client
+
+
+@pytest.fixture
+def ds_verify_key(ds_client: DatasiteClient):
+    yield ds_client.credentials.verify_key
 
 
 @pytest.fixture
 def document_store(worker):
-    yield worker.document_store
-    worker.document_store.reset()
+    yield worker.db
 
 
 @pytest.fixture
@@ -167,63 +213,79 @@ def action_store(worker):
     yield worker.action_store
 
 
-@pytest.fixture(scope="session")
-def mongo_client(testrun_uid):
-    """
-    A race-free fixture that starts a MongoDB server for an entire pytest session.
-    Cleans up the server when the session ends, or when the last client disconnects.
-    """
-    db_name = f"pytest_mongo_{testrun_uid}"
-    root_dir = Path(gettempdir(), db_name)
-    state = SharedState(db_name)
-    KEY_CONN_STR = "mongoConnectionString"
-    KEY_CLIENTS = "mongoClients"
+@pytest.fixture(autouse=True)
+def patched_session_cache(monkeypatch):
+    # patching compute heavy hashing to speed up tests
 
-    # start the server if it's not already running
-    with state.lock:
-        conn_str = state.get(KEY_CONN_STR, None)
+    def _get_key(email, password, connection):
+        return f"{email}{password}{connection}"
 
-        if not conn_str:
-            conn_str = start_mongo_server(db_name)
-            state.set(KEY_CONN_STR, conn_str)
-
-        # increment the number of clients
-        clients = state.get(KEY_CLIENTS, 0) + 1
-        state.set(KEY_CLIENTS, clients)
-
-    # create a client, and test the connection
-    client = MongoClient(conn_str)
-    assert client.server_info().get("ok") == 1.0
-
-    yield client
-
-    # decrement the number of clients
-    with state.lock:
-        clients = state.get(KEY_CLIENTS, 0) - 1
-        state.set(KEY_CLIENTS, clients)
-
-    # if no clients are connected, destroy the server
-    if clients <= 0:
-        stop_mongo_server(db_name)
-        state.purge()
-        shutil.rmtree(root_dir, ignore_errors=True)
+    monkeypatch.setattr("syft.client.client.SyftClientSessionCache._get_key", _get_key)
 
 
-__all__ = [
-    "mongo_store_partition",
-    "mongo_document_store",
-    "mongo_queue_stash",
-    "mongo_action_store",
-    "sqlite_store_partition",
-    "sqlite_workspace",
-    "sqlite_document_store",
-    "sqlite_queue_stash",
-    "sqlite_action_store",
-    "dict_store_partition",
-    "dict_action_store",
-    "dict_document_store",
-    "dict_queue_stash",
-]
+cached_salt_and_hash_password = cache(user.salt_and_hash_password)
+cached_check_pwd = cache(user.check_pwd)
+
+
+@pytest.fixture(autouse=True)
+def patched_user(monkeypatch):
+    # patching compute heavy hashing to speed up tests
+
+    monkeypatch.setattr(
+        "syft.service.user.user.salt_and_hash_password",
+        cached_salt_and_hash_password,
+    )
+    monkeypatch.setattr(
+        "syft.service.user.user.check_pwd",
+        cached_check_pwd,
+    )
+
+
+@pytest.fixture
+def small_dataset() -> Dataset:
+    dataset = Dataset(
+        name="small_dataset",
+        asset_list=[
+            sy.Asset(
+                name="small_dataset",
+                data=np.array([1, 2, 3]),
+                mock=np.array([1, 1, 1]),
+            )
+        ],
+    )
+    yield dataset
+
+
+@pytest.fixture
+def big_dataset() -> Dataset:
+    num_elements = 20 * 1024 * 1024
+    data_big = np.random.randint(0, 100, size=num_elements)
+    mock_big = np.random.randint(0, 100, size=num_elements)
+    dataset = Dataset(
+        name="big_dataset",
+        asset_list=[
+            sy.Asset(
+                name="big_dataset",
+                data=data_big,
+                mock=mock_big,
+            )
+        ],
+    )
+    yield dataset
+
+
+@pytest.fixture(
+    scope="function",
+    params=[
+        "tODOsqlite_address",
+        # "TODOpostgres_address", # will be used when we have a postgres CI tests
+    ],
+)
+def queue_stash(request):
+    _ = request.param
+    stash = QueueStash.random()
+    yield stash
+
 
 pytest_plugins = [
     "tests.syft.users.fixtures",
@@ -231,6 +293,5 @@ pytest_plugins = [
     "tests.syft.request.fixtures",
     "tests.syft.dataset.fixtures",
     "tests.syft.notifications.fixtures",
-    "tests.syft.action_graph.fixtures",
     "tests.syft.serde.fixtures",
 ]

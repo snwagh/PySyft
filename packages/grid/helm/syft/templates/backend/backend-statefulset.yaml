@@ -20,12 +20,21 @@ spec:
       labels:
         {{- include "common.labels" . | nindent 8 }}
         app.kubernetes.io/component: backend
+        {{- if .Values.server.podLabels }}
+        {{- toYaml .Values.server.podLabels | nindent 8 }}
+        {{- end }}
+      {{- if .Values.server.podAnnotations }}
+      annotations: {{- toYaml .Values.server.podAnnotations | nindent 8 }}
+      {{- end }}
     spec:
+      {{- if .Values.server.nodeSelector }}
+      nodeSelector: {{- .Values.server.nodeSelector | toYaml | nindent 8 }}
+      {{- end }}
       containers:
         - name: backend-container
-          image: {{ .Values.global.registry }}/openmined/grid-backend:{{ .Values.global.version }}
+          image: {{ .Values.global.registry }}/openmined/syft-backend:{{ .Values.global.version }}
           imagePullPolicy: Always
-          resources: {{ include "common.resources.set" (dict "resources" .Values.node.resources "preset" .Values.node.resourcesPreset) | nindent 12 }}
+          resources: {{ include "common.resources.set" (dict "resources" .Values.server.resources "preset" .Values.server.resourcesPreset) | nindent 12 }}
           env:
             # kubernetes runtime
             - name: K8S_POD_NAME
@@ -39,60 +48,93 @@ spec:
             - name: CONTAINER_HOST
               value: "k8s"
             # syft
-            - name: NODE_TYPE
-              value: {{ .Values.node.type | default "domain" | quote }}
-            - name: NODE_NAME
-              value: {{ .Values.node.name | default .Release.Name | quote }}
-            - name: NODE_SIDE_TYPE
-              value: {{ .Values.node.side | quote }}
+            - name: SERVER_TYPE
+              value: {{ .Values.server.type | default "datasite" | quote }}
+            - name: SERVER_NAME
+              value: {{ .Values.server.name | default (printf "%s-server" .Release.Name) | quote }}
+            - name: SERVER_SIDE_TYPE
+              value: {{ .Values.server.side | quote }}
             - name: DEFAULT_ROOT_EMAIL
-              value: {{ .Values.node.rootEmail | required "node.rootEmail is required" | quote }}
+              value: {{ .Values.server.rootEmail | required "server.rootEmail is required" | quote }}
             - name: DEFAULT_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.node.secretKeyName | required "node.secretKeyName is required" }}
+                  name: {{ .Values.server.secretKeyName | required "server.secretKeyName is required" }}
                   key: defaultRootPassword
             - name: LOG_LEVEL
-              value: {{ .Values.node.logLevel | quote }}
+              value: {{ .Values.server.logLevel | quote }}
             - name: QUEUE_PORT
-              value: {{ .Values.node.queuePort | quote }}
+              value: {{ .Values.server.queuePort | quote }}
             - name: CREATE_PRODUCER
               value: "true"
             - name: INMEMORY_WORKERS
-              value: {{ .Values.node.inMemoryWorkers | quote }}
+              value: {{ .Values.server.inMemoryWorkers | quote }}
             - name: DEFAULT_WORKER_POOL_IMAGE
-              value: "{{ .Values.global.registry }}/openmined/grid-backend:{{ .Values.global.version }}"
+              value: "{{ .Values.global.registry }}/openmined/syft-backend:{{ .Values.global.workerVersion }}"
             - name: DEFAULT_WORKER_POOL_COUNT
-              value: {{ .Values.node.defaultWorkerPoolCount | quote }}
-            {{- if .Values.node.debuggerEnabled }}
+              value: {{ .Values.server.defaultWorkerPool.count | quote }}
+            - name: DEFAULT_WORKER_POOL_POD_LABELS
+              value: {{ .Values.server.defaultWorkerPool.podLabels | toJson | quote }}
+            - name: DEFAULT_WORKER_POOL_POD_ANNOTATIONS
+              value: {{ .Values.server.defaultWorkerPool.podAnnotations | toJson | quote }}
+            - name: USE_INTERNAL_REGISTRY
+              value: {{ .Values.server.useInternalRegistry | quote }}
+            - name: KANIKO_VERSION
+              value: {{ .Values.global.kaniko.version | quote }}
+            {{- if .Values.server.defaultBucketName }}
+            - name: DEFAULT_BUCKET_NAME
+              value: {{ .Values.server.defaultBucketName | quote }}
+            {{- end }}
+            {{- if .Values.server.debuggerEnabled }}
             - name: DEBUGGER_ENABLED
+              value: "True"
+            {{- end }}
+            {{- if eq .Values.server.type "gateway" }}
+            - name: ASSOCIATION_REQUEST_AUTO_APPROVAL
+              value: {{ .Values.server.associationRequestAutoApproval | quote }}
+            {{- end }}
+            {{- if .Values.rtunnel.enabled }}
+            - name: RATHOLE_PORT
+              value: {{ .Values.rtunnel.port | quote }}
+            - name: REVERSE_TUNNEL_ENABLED
               value: "true"
             {{- end }}
-            # MongoDB
-            - name: MONGO_PORT
-              value: {{ .Values.mongo.port | quote }}
-            - name: MONGO_HOST
-              value: "mongo"
-            - name: MONGO_USERNAME
-              value: {{ .Values.mongo.username | quote }}
-            - name: MONGO_PASSWORD
+            # Postgres
+            - name: POSTGRESQL_PORT
+              value: {{ .Values.postgres.port | quote }}
+            - name: POSTGRESQL_HOST
+              value: "postgres"
+            - name: POSTGRESQL_USERNAME
+              value: {{ .Values.postgres.username | quote }}
+            - name: POSTGRESQL_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.mongo.secretKeyName | required "mongo.secretKeyName is required" }}
+                  name: {{ .Values.postgres.secretKeyName | required "postgres.secretKeyName is required" }}
                   key: rootPassword
+            - name: POSTGRESQL_DBNAME
+              value: {{ .Values.postgres.dbname | quote }}
+            {{- if .Values.server.smtp.enabled }}
             # SMTP
             - name: SMTP_HOST
-              value: {{ .Values.node.smtp.host | quote }}
+              value: {{ .Values.server.smtp.host | required "server.smtp.host is required" | quote }}
             - name: SMTP_PORT
-              value: {{ .Values.node.smtp.port | quote }}
+              value: {{ .Values.server.smtp.port | required "server.smtp.port is required" | quote }}
             - name: SMTP_USERNAME
-              value: {{ .Values.node.smtp.username | quote }}
+              value: {{ .Values.server.smtp.username | required "server.smtp.username is required" | quote }}
             - name: SMTP_PASSWORD
-              value: {{ .Values.node.smtp.password | quote }}
+              {{- if .Values.server.smtp.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.smtp.existingSecret }}
+                  key: smtpPassword
+              {{ else }}
+              value: {{ .Values.server.smtp.password | required "server.smtp.password is required" | quote }}
+              {{ end }}
             - name: EMAIL_SENDER
-              value: {{ .Values.node.smtp.from | quote}}
+              value: {{ .Values.server.smtp.from | required "server.smtp.from is required" | quote}}
+            {{- end }}
             # SeaweedFS
-            {{- if ne .Values.node.type "gateway"}}
+            {{- if ne .Values.server.type "gateway"}}
             - name: S3_ROOT_USER
               value: {{ .Values.seaweedfs.s3.rootUser | quote }}
             - name: S3_ROOT_PWD
@@ -100,34 +142,25 @@ spec:
                 secretKeyRef:
                     name: {{ .Values.seaweedfs.secretKeyName | required "seaweedfs.secretKeyName is required" }}
                     key: s3RootPassword
-            - name: S3_PORT
-              value: {{ .Values.seaweedfs.s3.port | quote }}
-            - name: SEAWEED_MOUNT_PORT
-              value: {{ .Values.seaweedfs.mountApi.port | quote }}
             {{- end }}
+            - name: MIN_SIZE_BLOB_STORAGE_MB
+              value: {{ .Values.seaweedfs.minSizeBlobStorageMB | quote }}
+            {{- if .Values.server.tracing.enabled }}
             # Tracing
-            - name: TRACE
-              value: "false"
-            - name: SERVICE_NAME
-              value: "backend"
-            - name: JAEGER_HOST
-              value: "localhost"
-            - name: JAEGER_PORT
-              value: "14268"
-            # Oblivious
-            {{- if .Values.node.oblv.enabled }}
-            - name: OBLV_LOCALHOST_PORT
-              value: {{ .Values.node.oblv.port | quote }}
-            - name: OBLV_ENABLED
-              value: {{ .Values.node.oblv.enabled | quote }}
+            - name: TRACING
+              value: {{ .Values.server.tracing.enabled | default "False" | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.server.tracing.otlpEndpoint | required "server.tracing.otlpEndpoint is required" | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: {{ .Values.server.tracing.otlpProtocol | default "grpc" | quote }}
             {{- end }}
-            # Veilid
-            {{- if .Values.veilid.enabled }}
-            - name: VEILID_ENABLED
-              value: {{ .Values.veilid.enabled | quote }}
+            # Enclave attestation
+            {{- if .Values.attestation.enabled }}
+            - name: ENCLAVE_ATTESTATION_ENABLED
+              value: {{ .Values.attestation.enabled | quote }}
             {{- end }}
-            {{- if .Values.node.env }}
-            {{- toYaml .Values.node.env | nindent 12 }}
+            {{- if .Values.server.env }}
+            {{- toYaml .Values.server.env | nindent 12 }}
             {{- end }}
           ports:
             - name: api-port
@@ -151,6 +184,53 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe: null
+        {{- if .Values.attestation.enabled }}
+        - name: enclave-attestation
+          image: {{ .Values.global.registry }}/openmined/syft-enclave-attestation:{{ .Values.global.version }}
+          imagePullPolicy: Always
+          resources: {{ include "common.resources.set" (dict "resources" .Values.attestation.resources "preset" .Values.attestation.resourcesPreset) | nindent 12 }}
+          env:
+            - name: UVICORN_LOG_LEVEL
+              value: {{ .Values.attestation.uvicornLogLevel }}
+            - name: APP_LOG_LEVEL
+              value: {{ .Values.attestation.appLogLevel }}
+            {{- if .Values.attestation.env }}
+            {{- toYaml .Values.attestation.env | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: kernel-security
+              mountPath: /sys/kernel/security
+            - name: tpm-device
+              mountPath: /dev/tpmrm0
+          securityContext:
+            privileged: true
+          ports:
+            - name: attestation-api
+              containerPort: 4455
+          startupProbe:
+            httpGet:
+              path: /?probe=startupProbe
+              port: attestation-api
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /?probe=livenessProbe
+              port: attestation-api
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe: null
+        {{ end }}
+      {{- if .Values.attestation.enabled }}
+      volumes:
+        - name: kernel-security
+          hostPath:
+            path: /sys/kernel/security
+        - name: tpm-device
+          hostPath:
+            path: /dev/tpmrm0
+      {{- end }}
       serviceAccountName: backend-service-account
       terminationGracePeriodSeconds: 5
   volumeClaimTemplates:

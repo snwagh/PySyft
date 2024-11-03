@@ -1,7 +1,7 @@
 # syft absolute
 import syft as sy
 from syft.custom_worker.config import DockerWorkerConfig
-from syft.node.worker import Worker
+from syft.server.worker import Worker
 from syft.service.response import SyftSuccess
 from syft.service.worker.worker_image import SyftWorkerImage
 from syft.types.datetime import DateTime
@@ -10,7 +10,7 @@ from syft.types.datetime import DateTime
 def get_docker_config():
     # the DS makes a request to create an image and a pool based on the image
     custom_dockerfile = f"""
-        FROM openmined/grid-backend:{sy.__version__}
+        FROM openmined/syft-backend:{sy.__version__}
         RUN pip install recordlinkage
     """
     return DockerWorkerConfig(dockerfile=custom_dockerfile)
@@ -23,8 +23,8 @@ def test_syft_worker(worker: Worker):
     """
     root_client = worker.root_client
     docker_config = get_docker_config()
-    submit_result = root_client.api.services.worker_image.submit_dockerfile(
-        docker_config=docker_config
+    submit_result = root_client.api.services.worker_image.submit(
+        worker_config=docker_config
     )
     assert isinstance(submit_result, SyftSuccess)
 
@@ -43,7 +43,7 @@ def test_syft_worker(worker: Worker):
     pool_name = "custom-worker-pool"
     num_workers = 3
     worker_pool_res = root_client.api.services.worker_pool.launch(
-        name=pool_name,
+        pool_name=pool_name,
         image_uid=worker_image.id,
         num_workers=num_workers,
     )

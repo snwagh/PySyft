@@ -3,6 +3,9 @@ from enum import Enum
 from typing import Any
 
 # third party
+from pydantic import GetCoreSchemaHandler
+from pydantic_core import CoreSchema
+from pydantic_core import core_schema
 from typing_extensions import Self
 
 # relative
@@ -19,10 +22,16 @@ class ServiceRoleCapability(Enum):
     CAN_MANAGE_INFRASTRUCTURE = 64
     CAN_UPLOAD_DATA = 128
     CAN_UPLOAD_LEGAL_DOCUMENT = 256
-    CAN_EDIT_DOMAIN_SETTINGS = 512
+    CAN_EDIT_DATASITE_SETTINGS = 512
 
 
-@serializable()
+def _str_to_role(v: Any) -> Any:
+    if isinstance(v, str) and hasattr(ServiceRole, v_upper := v.upper()):
+        return getattr(ServiceRole, v_upper)
+    return v
+
+
+@serializable(canonical_name="ServiceRole", version=1)
 class ServiceRole(Enum):
     NONE = 0
     GUEST = 1
@@ -34,9 +43,7 @@ class ServiceRole(Enum):
     # @property
     @classmethod
     def roles_descending(cls) -> list[tuple[int, Self]]:
-        tuples = []
-        for x in cls:
-            tuples.append((x.value, x))
+        tuples = [(x.value, x) for x in cls]
         return sorted(tuples, reverse=True)
 
     @classmethod
@@ -55,6 +62,19 @@ class ServiceRole(Enum):
                 roles.append(role_enum)
                 level_float = level_float % role_num
         return roles
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        _source_type: Any,
+        _handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        return core_schema.chain_schema(
+            [
+                core_schema.no_info_plain_validator_function(_str_to_role),
+                core_schema.is_instance_schema(cls),
+            ]
+        )
 
     def capabilities(self) -> list[ServiceRoleCapability]:
         return ROLE_TO_CAPABILITIES[self]

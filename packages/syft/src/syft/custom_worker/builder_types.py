@@ -29,6 +29,10 @@ class ImagePushResult(BaseModel):
     logs: str
     exit_code: int
 
+    @property
+    def has_failed(self) -> bool:
+        return self.exit_code != 0
+
 
 class BuilderBase(ABC):
     @abstractmethod
@@ -46,9 +50,9 @@ class BuilderBase(ABC):
     def push_image(
         self,
         tag: str,
-        username: str,
-        password: str,
         registry_url: str,
+        username: str | None = None,
+        password: str | None = None,
         **kwargs: Any,
     ) -> ImagePushResult:
         pass

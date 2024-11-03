@@ -3,13 +3,15 @@ from __future__ import annotations
 
 # stdlib
 from collections.abc import Callable
+from collections.abc import Iterable
 from enum import Enum
 import inspect
 from io import BytesIO
+import logging
 from pathlib import Path
+import sys
 import threading
 import time
-import traceback
 import types
 from typing import Any
 from typing import ClassVar
@@ -20,32 +22,33 @@ from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
-from result import Err
-from result import Ok
-from result import Result
 from typing_extensions import Self
 
 # relative
-from ...client.api import APIRegistry
 from ...client.api import SyftAPI
 from ...client.api import SyftAPICall
 from ...client.client import SyftClient
-from ...node.credentials import SyftVerifyKey
 from ...serde.serializable import serializable
 from ...serde.serialize import _serialize as serialize
-from ...service.response import SyftError
+from ...server.credentials import SyftVerifyKey
+from ...service.blob_storage.util import can_upload_to_blob_storage
+from ...service.response import SyftSuccess
+from ...service.response import SyftWarning
 from ...store.linked_obj import LinkedObject
 from ...types.base import SyftBaseModel
 from ...types.datetime import DateTime
-from ...types.syft_object import SYFT_OBJECT_VERSION_2
-from ...types.syft_object import SYFT_OBJECT_VERSION_3
+from ...types.errors import SyftException
+from ...types.result import Err
+from ...types.result import as_result
+from ...types.syft_object import SYFT_OBJECT_VERSION_1
 from ...types.syft_object import SyftBaseObject
 from ...types.syft_object import SyftObject
+from ...types.syft_object_registry import SyftObjectRegistry
 from ...types.syncable_object import SyncableSyftObject
 from ...types.uid import LineageID
 from ...types.uid import UID
-from ...util.logger import debug
-from ..response import SyftException
+from ...util.util import prompt_warning_message
+from ..context import AuthedServiceContext
 from ..service import from_api_or_context
 from .action_data_empty import ActionDataEmpty
 from .action_data_empty import ActionDataLink
@@ -55,6 +58,8 @@ from .action_types import action_type_for_object
 from .action_types import action_type_for_type
 from .action_types import action_types
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     # relative
     from ..sync.diff_state import AttrDiff
@@ -62,14 +67,14 @@ if TYPE_CHECKING:
 NoneType = type(None)
 
 
-@serializable()
+@serializable(canonical_name="TwinMode", version=1)
 class TwinMode(Enum):
     NONE = 0
     PRIVATE = 1
     MOCK = 2
 
 
-@serializable()
+@serializable(canonical_name="ActionType", version=1)
 class ActionType(Enum):
     GETATTRIBUTE = 1
     METHOD = 2
@@ -77,6 +82,7 @@ class ActionType(Enum):
     FUNCTION = 8
     CREATEOBJECT = 16
     SYFTFUNCTION = 32
+    TWINAPI = 64
 
 
 def repr_cls(c: Any) -> str:
@@ -103,7 +109,7 @@ class Action(SyftObject):
     """
 
     __canonical_name__ = "Action"
-    __version__ = SYFT_OBJECT_VERSION_3
+    __version__ = SYFT_OBJECT_VERSION_1
 
     __attr_searchable__: ClassVar[list[str]] = []
 
@@ -129,11 +135,8 @@ class Action(SyftObject):
 
     @property
     def job_display_name(self) -> str:
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_location,
-            user_verify_key=self.syft_client_verify_key,
-        )
-        if self.user_code_id is not None and api is not None:
+        if self.user_code_id is not None:
+            api = self.get_api()
             user_code = api.services.code.get_by_id(self.user_code_id)
             return user_code.service_func_name
         else:
@@ -195,6 +198,16 @@ class Action(SyftObject):
         )
         return action
 
+    @classmethod
+    def from_api_endpoint_execution(cls: type[Self]) -> Action:
+        return cls(
+            args=[],
+            kwargs={},
+            result_id=LineageID(),
+            action_type=ActionType.TWINAPI,
+            user_code_id=None,
+        )
+
     def __repr__(self) -> str:
         def repr_uid(_id: LineageID) -> str:
             return f"{str(_id)[:3]}..{str(_id)[-1]}"
@@ -211,6 +224,7 @@ class Action(SyftObject):
         )
 
 
+@serializable(canonical_name="ActionObjectPointer", version=1)
 class ActionObjectPointer:
     pass
 
@@ -220,6 +234,8 @@ HOOK_ALWAYS = "ALWAYS"
 HOOK_ON_POINTERS = "ON_POINTERS"
 
 passthrough_attrs = [
+    "id",
+    "refresh_object",
     "__dict__",  # python
     "__class__",  # python
     "__repr_name__",  # python
@@ -232,10 +248,14 @@ passthrough_attrs = [
     "__repr_str__",  # pydantic
     "__repr_args__",  # pydantic
     "__post_init__",  # syft
+    "_get_api",  # syft
     "__validate_private_attrs__",  # syft
     "id",  # syft
-    "to_mongo",  # syft 🟡 TODO 23: Add composeable / inheritable object passthrough attrs
+    "created_date",  # syft
+    "updated_date",  # syft
+    "deleted_date",  # syft
     "__attr_searchable__",  # syft
+    "__attr_unique__",  # syft
     "__canonical_name__",  # syft
     "__version__",  # syft
     "__args__",  # pydantic
@@ -250,11 +270,12 @@ passthrough_attrs = [
     "_save_to_blob_storage_",  # syft
     "syft_action_data",  # syft
     "syft_resolved",  # syft
-    "syft_action_data_node_id",
-    "node_uid",
+    "syft_action_data_server_id",
+    "server_uid",
     "migrate_to",  # syft
     "to_dict",  # syft
     "dict",  # syft
+    "has_storage_permission",  # syft
     "_iter",  # pydantic
     "__exclude_fields__",  # pydantic
     "__include_fields__",  # pydantic
@@ -298,10 +319,21 @@ passthrough_attrs = [
     "__private_sync_attr_mocks__",  # syft
     "__exclude_sync_diff_attrs__",  # syft
     "__repr_attrs__",  # syft
+    "get_sync_dependencies",
+    "_data_repr",
+    "syft_eq",  # syft
+    "__table_coll_widths__",
+    "_clear_cache",
+    "_set_reprs",
+    "get_api",
+    "get_api_wrapped",
 ]
 dont_wrap_output_attrs = [
+    "id",
+    "refresh_object",
     "__repr__",
     "__str__",
+    "__repr_attrs__",
     "_repr_html_",
     "_repr_markdown_",
     "_repr_latex_",
@@ -311,14 +343,24 @@ dont_wrap_output_attrs = [
     "__bool__",
     "__len__",
     "syft_resolved",  # syft
-    "node_uid",
-    "syft_action_data_node_id",
+    "server_uid",
+    "syft_action_data_server_id",
     "__sha256__",
     "__hash_exclude_attrs__",
     "__exclude_sync_diff_attrs__",  # syft
-    "__repr_attrs__",
+    "__repr_attrs__",  # syft
+    "get_sync_dependencies",  # syft
+    "syft_eq",  # syft
+    "__table_coll_widths__",
+    "_clear_cache",
+    "_set_reprs",
+    "get_api",
+    "get_api_wrapped",
 ]
 dont_make_side_effects = [
+    "refresh_object",
+    "id",
+    "__repr_attrs__",
     "_repr_html_",
     "_repr_markdown_",
     "_repr_latex_",
@@ -328,22 +370,44 @@ dont_make_side_effects = [
     "__len__",
     "shape",
     "syft_resolved",  # syft
-    "node_uid",
-    "syft_action_data_node_id",
+    "server_uid",
+    "syft_action_data_server_id",
     "__sha256__",
     "__hash_exclude_attrs__",
     "__exclude_sync_diff_attrs__",  # syft
     "__repr_attrs__",
+    "get_sync_dependencies",
+    "syft_eq",  # syft
+    "__table_coll_widths__",
+    "_clear_cache",
+    "_set_reprs",
+    "get_api",
+    "get_api_wrapped",
 ]
 action_data_empty_must_run = [
     "__repr__",
     "__str__",
 ]
 
+methods_to_check_in_cache = [
+    "_ipython_display_",
+    "_repr_mimebundle_",
+    "_repr_latex_",
+    "_repr_javascript_",
+    "_repr_html_",
+    "_repr_jpeg_",
+    "_repr_png_",
+    "_repr_svg_",
+    "_repr_pretty_",
+    "_repr_pdf_",
+    "_repr_json_",
+    "_repr_markdown_",
+]
+
 
 class PreHookContext(SyftBaseObject):
     __canonical_name__ = "PreHookContext"
-    __version__ = SYFT_OBJECT_VERSION_2
+    __version__ = SYFT_OBJECT_VERSION_1
 
     """Hook context
 
@@ -352,8 +416,8 @@ class PreHookContext(SyftBaseObject):
             The ActionObject to use for the action
         op_name: str
             The method name to use for the action
-        node_uid: Optional[UID]
-            Optional Syft node UID
+        server_uid: Optional[UID]
+            Optional Syft server UID
         result_id: Optional[Union[UID, LineageID]]
             Optional result Syft UID
         action: Optional[Action]
@@ -362,16 +426,17 @@ class PreHookContext(SyftBaseObject):
 
     obj: Any = None
     op_name: str
-    node_uid: UID | None = None
+    server_uid: UID | None = None
     result_id: UID | LineageID | None = None
     result_twin_type: TwinMode | None = None
     action: Action | None = None
     action_type: ActionType | None = None
 
 
+@as_result(SyftException)
 def make_action_side_effect(
     context: PreHookContext, *args: Any, **kwargs: Any
-) -> Result[Ok[tuple[PreHookContext, tuple[Any, ...], dict[str, Any]]], Err[str]]:
+) -> tuple[PreHookContext, tuple[Any, ...], dict[str, Any]]:
     """Create a new action from context_op_name, and add it to the PreHookContext
 
     Parameters:
@@ -385,8 +450,6 @@ def make_action_side_effect(
         - Ok[[Tuple[PreHookContext, Tuple[Any, ...], Dict[str, Any]]] on success
         - Err[str] on failure
     """
-    # relative
-
     try:
         action = context.obj.syft_make_action_with_self(
             op=context.op_name,
@@ -395,11 +458,10 @@ def make_action_side_effect(
             action_type=context.action_type,
         )
         context.action = action
-    except Exception:
-        print(f"make_action_side_effect failed with {traceback.format_exc()}")
-        return Err(f"make_action_side_effect failed with {traceback.format_exc()}")
+    except Exception as e:
+        raise SyftException(public_message=f"make_action_side_effect failed {e}") from e
 
-    return Ok((context, args, kwargs))
+    return context, args, kwargs
 
 
 class TraceResultRegistry:
@@ -438,98 +500,77 @@ class TraceResult(SyftBaseModel):
     is_tracing: bool = False
 
 
+@as_result(SyftException)
 def trace_action_side_effect(
     context: PreHookContext, *args: Any, **kwargs: Any
-) -> Result[Ok[tuple[PreHookContext, tuple[Any, ...], dict[str, Any]]], Err[str]]:
+) -> tuple[PreHookContext, tuple[Any, ...], dict[str, Any]]:
     action = context.action
     if action is not None and TraceResultRegistry.current_thread_is_tracing():
         trace_result = TraceResultRegistry.get_trace_result_for_thread()
         trace_result.result += [action]  # type: ignore
-    return Ok((context, args, kwargs))
+    return context, args, kwargs
 
 
 def convert_to_pointers(
     api: SyftAPI,
-    node_uid: UID | None = None,
+    server_uid: UID | None = None,
     args: list | None = None,
     kwargs: dict | None = None,
 ) -> tuple[list, dict]:
     # relative
     from ..dataset.dataset import Asset
 
-    arg_list = []
-    kwarg_dict = {}
-    if args is not None:
-        for arg in args:
-            if (
-                not isinstance(arg, ActionObject | Asset | UID)
-                and api.signing_key is not None  # type: ignore[unreachable]
-            ):
-                arg = ActionObject.from_obj(  # type: ignore[unreachable]
-                    syft_action_data=arg,
-                    syft_client_verify_key=api.signing_key.verify_key,
-                    syft_node_location=api.node_uid,
-                )
-                arg.syft_node_uid = node_uid
-                r = arg._save_to_blob_storage()
-                if isinstance(r, SyftError):
-                    print(r.message)
-                arg = api.services.action.set(arg)
-            arg_list.append(arg)
+    def process_arg(arg: ActionObject | Asset | UID | Any) -> Any:
+        if (
+            not isinstance(arg, ActionObject | Asset | UID)
+            and api.signing_key is not None  # type: ignore[unreachable]
+        ):
+            arg = ActionObject.from_obj(  # type: ignore[unreachable]
+                syft_action_data=arg,
+                syft_client_verify_key=api.signing_key.verify_key,
+                syft_server_location=api.server_uid,
+            )
+            arg.syft_server_uid = server_uid
+            r = arg._save_to_blob_storage().unwrap()
+            if isinstance(r, SyftWarning):
+                logger.debug(r.message)
+            arg = api.services.action.set(arg)
+        return arg
 
-    if kwargs is not None:
-        for k, arg in kwargs.items():
-            if (
-                not isinstance(arg, ActionObject | Asset | UID)
-                and api.signing_key is not None  # type: ignore[unreachable]
-            ):
-                arg = ActionObject.from_obj(  # type: ignore[unreachable]
-                    syft_action_data=arg,
-                    syft_client_verify_key=api.signing_key.verify_key,
-                    syft_node_location=api.node_uid,
-                )
-                arg.syft_node_uid = node_uid
-                r = arg._save_to_blob_storage()
-                if isinstance(r, SyftError):
-                    print(r.message)
-                arg = api.services.action.set(arg)
-
-            kwarg_dict[k] = arg
+    arg_list = [process_arg(arg) for arg in args] if args else []
+    kwarg_dict = {k: process_arg(v) for k, v in kwargs.items()} if kwargs else {}
 
     return arg_list, kwarg_dict
 
 
+@as_result(SyftException)
 def send_action_side_effect(
     context: PreHookContext, *args: Any, **kwargs: Any
-) -> Result[Ok[tuple[PreHookContext, tuple[Any, ...], dict[str, Any]]], Err[str]]:
-    """Create a new action from the context.op_name, and execute it on the remote node."""
+) -> tuple[PreHookContext, tuple[Any, ...], dict[str, Any]]:
+    """Create a new action from the context.op_name, and execute it on the remote server."""
     try:
         if context.action is None:
-            result = make_action_side_effect(context, *args, **kwargs)
-            if result.is_err():
-                raise RuntimeError(result.err())
-
-            context, _, _ = result.ok()
+            context, _, _ = make_action_side_effect(context, *args, **kwargs).unwrap()
 
         action_result = context.obj.syft_execute_action(context.action, sync=True)
 
         if not isinstance(action_result, ActionObject):
-            raise RuntimeError(f"Got back unexpected response : {action_result}")
+            raise SyftException(
+                public_message=f"Got back unexpected response : {action_result}"
+            )
         else:
-            context.node_uid = action_result.syft_node_uid
+            context.server_uid = action_result.syft_server_uid
             context.result_id = action_result.id
             context.result_twin_type = action_result.syft_twin_type
     except Exception as e:
-        return Err(
-            f"send_action_side_effect failed with {e}\n {traceback.format_exc()}"
-        )
-    return Ok((context, args, kwargs))
+        # print(e)
+        raise SyftException(public_message=f"send_action_side_effect failed {e}") from e
+    return context, args, kwargs
 
 
-def propagate_node_uid(
-    context: PreHookContext, op: str, result: Any
-) -> Result[Ok[Any], Err[str]]:
-    """Patch the result to include the syft_node_uid
+@as_result(SyftException)
+def propagate_server_uid(context: PreHookContext, op: str, result: Any) -> Any:
+    """Patch the result to include the syft_server_uid
 
     Parameters:
         context: PreHookContext
@@ -543,24 +584,28 @@ def propagate_node_uid(
         - Err[str] on failure
     """
     if context.op_name in dont_make_side_effects or not hasattr(
-        context.obj, "syft_node_uid"
+        context.obj, "syft_server_uid"
     ):
-        return Ok(result)
+        return result
 
     try:
-        syft_node_uid = getattr(context.obj, "syft_node_uid", None)
-        if syft_node_uid is None:
-            raise RuntimeError("Can't proagate node_uid because parent doesnt have one")
+        syft_server_uid = getattr(context.obj, "syft_server_uid", None)
+        if syft_server_uid is None:
+            raise SyftException(
+                public_message="Can't proagate server_uid because parent doesnt have one"
+            )
 
         if op not in context.obj._syft_dont_wrap_attrs():
-            if hasattr(result, "syft_node_uid"):
-                result.syft_node_uid = syft_node_uid
+            if hasattr(result, "syft_server_uid"):
+                result.syft_server_uid = syft_server_uid
         else:
-            raise RuntimeError("dont propogate node_uid because output isnt wrapped")
+            raise SyftException(
+                public_message="dont propogate server_uid because output isnt wrapped"
+            )
     except Exception:
-        return Err(f"propagate_node_uid failed with {traceback.format_exc()}")
+        raise SyftException(public_message="propagate_server_uid failed")
 
-    return Ok(result)
+    return result
 
 
 def debox_args_and_kwargs(args: Any, kwargs: Any) -> tuple[Any, Any]:
@@ -582,6 +627,7 @@ def debox_args_and_kwargs(args: Any, kwargs: Any) -> tuple[Any, Any]:
 
 
 BASE_PASSTHROUGH_ATTRS: list[str] = [
+    "id",
     "is_mock",
     "is_real",
     "is_twin",
@@ -605,8 +651,8 @@ BASE_PASSTHROUGH_ATTRS: list[str] = [
     "reload_cache",
     "syft_resolved",
     "refresh_object",
-    "syft_action_data_node_id",
-    "node_uid",
+    "syft_action_data_server_id",
+    "server_uid",
     "__sha256__",
     "__hash_exclude_attrs__",
     "__hash__",
@@ -614,7 +660,23 @@ BASE_PASSTHROUGH_ATTRS: list[str] = [
     "_has_private_sync_attrs",
     "__exclude_sync_diff_attrs__",
     "__repr_attrs__",
+    "get_sync_dependencies",
+    "_data_repr",
+    "syft_eq",
+    "__table_coll_widths__",
+    "_clear_cache",
+    "_set_reprs",
+    "get_api",
+    "get_api_wrapped",
 ]
+
+
+def truncate_str(string: str, length: int = 100) -> str:
+    stringlen = len(string)
+    if stringlen > length:
+        n_hidden = stringlen - length
+        string = f"{string[:length]}... ({n_hidden} characters hidden)"
+    return string
 
 
 @serializable(without=["syft_pre_hooks__", "syft_post_hooks__"])
@@ -622,7 +684,7 @@ class ActionObject(SyncableSyftObject):
     """Action object for remote execution."""
 
     __canonical_name__ = "ActionObject"
-    __version__ = SYFT_OBJECT_VERSION_3
+    __version__ = SYFT_OBJECT_VERSION_1
     __private_sync_attr_mocks__: ClassVar[dict[str, Any]] = {
         "syft_action_data_cache": None,
         "syft_blob_storage_entry_id": None,
@@ -640,7 +702,7 @@ class ActionObject(SyncableSyftObject):
     syft_parent_kwargs: Any | None = None
     syft_history_hash: int | None = None
     syft_internal_type: ClassVar[type[Any]]
-    syft_node_uid: UID | None = None
+    syft_server_uid: UID | None = None
     syft_pre_hooks__: dict[str, list] = {}
     syft_post_hooks__: dict[str, list] = {}
     syft_twin_type: TwinMode = TwinMode.NONE
@@ -652,7 +714,8 @@ class ActionObject(SyncableSyftObject):
     syft_resolve_data: bool | None = None
     syft_created_at: DateTime | None = None
     syft_resolved: bool = True
-    syft_action_data_node_id: UID | None = None
+    syft_action_data_server_id: UID | None = None
+    syft_action_saved_to_blob_store: bool = True
     # syft_dont_wrap_attrs = ["shape"]
 
     def syft_get_diffs(self, ext_obj: Any) -> list[AttrDiff]:
@@ -667,36 +730,39 @@ class ActionObject(SyncableSyftObject):
 
         low_data = ext_obj.syft_action_data
         high_data = self.syft_action_data
-        if low_data != high_data:
+
+        try:
+            cmp = low_data != high_data
+            if isinstance(cmp, Iterable):
+                cmp = all(cmp)
+        except Exception:
+            cmp = False
+
+        if cmp:
             diff_attr = AttrDiff(
                 attr_name="syft_action_data", low_attr=low_data, high_attr=high_data
             )
             diff_attrs.append(diff_attr)
         return diff_attrs
 
-    def _set_obj_location_(self, node_uid: UID, credentials: SyftVerifyKey) -> None:
-        self.syft_node_location = node_uid
+    def _set_obj_location_(self, server_uid: UID, credentials: SyftVerifyKey) -> None:
+        self.syft_server_location = server_uid
         self.syft_client_verify_key = credentials
-        if self.syft_action_data_node_id is None:
-            self.syft_action_data_node_id = node_uid
+        if self.syft_action_data_server_id is None:
+            self.syft_action_data_server_id = server_uid
 
     @property
     def syft_action_data(self) -> Any:
-        if (
-            self.syft_blob_storage_entry_id
-            and self.syft_created_at
-            and not TraceResultRegistry.current_thread_is_tracing()
-        ):
+        if self.syft_blob_storage_entry_id and self.syft_created_at:
             self.reload_cache()
-
         return self.syft_action_data_cache
 
-    def reload_cache(self) -> SyftError | None:
+    def reload_cache(self) -> None:
         # If ActionDataEmpty then try to fetch it from store.
         if isinstance(self.syft_action_data_cache, ActionDataEmpty):
             blob_storage_read_method = from_api_or_context(
                 func_or_path="blob_storage.read",
-                syft_node_location=self.syft_node_location,
+                syft_server_location=self.syft_server_location,
                 syft_client_verify_key=self.syft_client_verify_key,
             )
 
@@ -704,133 +770,153 @@ class ActionObject(SyncableSyftObject):
                 blob_retrieval_object = blob_storage_read_method(
                     uid=self.syft_blob_storage_entry_id
                 )
-                if isinstance(blob_retrieval_object, SyftError):
-                    print(
-                        "Could not fetch actionobject data\n",
-                        type(blob_retrieval_object),
-                    )
-                    return blob_retrieval_object
+
                 # relative
                 from ...store.blob_storage import BlobRetrieval
 
-                if isinstance(blob_retrieval_object, SyftError):
-                    return blob_retrieval_object
-                elif isinstance(blob_retrieval_object, BlobRetrieval):
+                if isinstance(blob_retrieval_object, BlobRetrieval):
                     # TODO: This change is temporary to for gateway to be compatible with the new blob storage
                     self.syft_action_data_cache = blob_retrieval_object.read()
-                    self.syft_action_data_type = type(self.syft_action_data)
+                    self.syft_action_data_type = type(self.syft_action_data_cache)
                     return None
                 else:
                     # In the case of gateway, we directly receive the actual object
-                    # TODO: The ideal solution would be to stream the object from the domain through the gateway
+                    # TODO: The ideal solution would be to stream the object from the datasite through the gateway
                     # Currently , we are just passing the object as it is, which would be fixed later.
                     self.syft_action_data_cache = blob_retrieval_object
-                    self.syft_action_data_type = type(self.syft_action_data)
+                    self.syft_action_data_type = type(self.syft_action_data_cache)
                     return None
             else:
-                print("cannot reload cache")
-                return None
+                raise SyftException(
+                    public_meesage="Could not reload cache, could not get read method"
+                )
 
         return None
 
-    def _save_to_blob_storage_(self, data: Any) -> SyftError | None:
+    def _save_to_blob_storage_(self, data: Any) -> SyftWarning | None:
         # relative
         from ...types.blob_storage import BlobFile
         from ...types.blob_storage import CreateBlobStorageEntry
 
         if not isinstance(data, ActionDataEmpty):
-            if isinstance(data, BlobFile) and not data.uploaded:
-                api = APIRegistry.api_for(
-                    self.syft_node_location, self.syft_client_verify_key
-                )
-                data.upload_to_blobstorage_from_api(api)
+            if isinstance(data, BlobFile):
+                if not data.uploaded:
+                    api = self.get_api()
+                    data._upload_to_blobstorage_from_api(api)
             else:
-                storage_entry = CreateBlobStorageEntry.from_obj(data)
+                get_metadata = from_api_or_context(
+                    func_or_path="metadata.get_metadata",
+                    syft_server_location=self.syft_server_location,
+                    syft_client_verify_key=self.syft_client_verify_key,
+                )
+                if (
+                    get_metadata is not None
+                    and not can_upload_to_blob_storage(data, get_metadata()).unwrap()
+                ):
+                    self.syft_action_saved_to_blob_store = False
+                    return SyftWarning(
+                        message=(
+                            f"The action object {self.id} was not saved to"
+                            f" the blob store but to memory cache since it is small."
+                        )
+                    )
+                serialized = serialize(data, to_bytes=True)
+                size = sys.getsizeof(serialized)
+                storage_entry = CreateBlobStorageEntry.from_obj(data, file_size=size)
+
+                if not TraceResultRegistry.current_thread_is_tracing():
+                    self.syft_action_data_cache = self.as_empty_data()
                 if self.syft_blob_storage_entry_id is not None:
                     # TODO: check if it already exists
                     storage_entry.id = self.syft_blob_storage_entry_id
                 allocate_method = from_api_or_context(
                     func_or_path="blob_storage.allocate",
-                    syft_node_location=self.syft_node_location,
+                    syft_server_location=self.syft_server_location,
                     syft_client_verify_key=self.syft_client_verify_key,
                 )
                 if allocate_method is not None:
                     blob_deposit_object = allocate_method(storage_entry)
-
-                    if isinstance(blob_deposit_object, SyftError):
-                        return blob_deposit_object
-
-                    result = blob_deposit_object.write(
-                        BytesIO(serialize(data, to_bytes=True))
-                    )
-                    if isinstance(result, SyftError):
-                        return result
+                    blob_deposit_object.write(BytesIO(serialized)).unwrap()
                     self.syft_blob_storage_entry_id = (
                         blob_deposit_object.blob_storage_entry_id
                     )
                 else:
-                    print("cannot save to blob storage")
+                    logger.warn("cannot save to blob storage. allocate_method=None")
 
             self.syft_action_data_type = type(data)
-
-            if inspect.isclass(data):
-                self.syft_action_data_repr_ = repr_cls(data)
-            else:
-                self.syft_action_data_repr_ = (
-                    data._repr_markdown_()
-                    if hasattr(data, "_repr_markdown_")
-                    else data.__repr__()
-                )
-            self.syft_action_data_str_ = str(data)
+            self._set_reprs(data)
             self.syft_has_bool_attr = hasattr(data, "__bool__")
         else:
-            debug("skipping writing action object to store, passed data was empty.")
+            logger.debug(
+                "skipping writing action object to store, passed data was empty."
+            )
 
         self.syft_action_data_cache = data
 
         return None
 
-    def _save_to_blob_storage(self) -> SyftError | None:
+    @as_result(SyftException)
+    def _save_to_blob_storage(
+        self, allow_empty: bool = False
+    ) -> SyftSuccess | SyftWarning:
         data = self.syft_action_data
-        if isinstance(data, SyftError):
-            return data
+
         if isinstance(data, ActionDataEmpty):
-            return SyftError(message=f"cannot store empty object {self.id}")
+            raise SyftException(
+                public_message=f"cannot store empty object {self.id} to the blob storage"
+            )
+
         result = self._save_to_blob_storage_(data)
-        if isinstance(result, SyftError):
+        if isinstance(result, SyftWarning):
             return result
         if not TraceResultRegistry.current_thread_is_tracing():
-            self.syft_action_data_cache = self.as_empty_data()
-        return None
+            self._clear_cache()
+        return SyftSuccess(message=f"Saved action object {self.id} to the blob store")
+
+    def _clear_cache(self) -> None:
+        self.syft_action_data_cache = self.as_empty_data()
+
+    def _set_reprs(self, data: any) -> None:
+        if inspect.isclass(data):
+            self.syft_action_data_repr_ = truncate_str(repr_cls(data))
+        else:
+            self.syft_action_data_repr_ = truncate_str(
+                data._repr_markdown_()
+                if hasattr(data, "_repr_markdown_")
+                else data.__repr__()
+            )
+        self.syft_action_data_str_ = truncate_str(str(data))
 
     @property
     def is_pointer(self) -> bool:
-        return self.syft_node_uid is not None
+        return self.syft_server_uid is not None
 
     @property
     def syft_lineage_id(self) -> LineageID:
-        """Compute the LineageID of the ActionObject, using the `id` and the `syft_history_hash` memebers"""
+        """Compute the LineageID of the ActionObject, using the `id` and the `syft_history_hash` members"""
         return LineageID(self.id, self.syft_history_hash)
 
     model_config = ConfigDict(validate_assignment=True)
 
     @model_validator(mode="before")
     @classmethod
-    def __check_action_data(cls, values: dict) -> dict:
-        v = values.get("syft_action_data_cache")
-        if values.get("syft_action_data_type", None) is None:
-            values["syft_action_data_type"] = type(v)
-        if not isinstance(v, ActionDataEmpty):
-            if inspect.isclass(v):
-                values["syft_action_data_repr_"] = repr_cls(v)
-            else:
-                values["syft_action_data_repr_"] = (
-                    v._repr_markdown_()
-                    if v is not None and hasattr(v, "_repr_markdown_")
-                    else v.__repr__()
-                )
-            values["syft_action_data_str_"] = str(v)
-            values["syft_has_bool_attr"] = hasattr(v, "__bool__")
+    def __check_action_data(cls, values: Any) -> dict:
+        if isinstance(values, dict):
+            v = values.get("syft_action_data_cache")
+            if values.get("syft_action_data_type", None) is None:
+                values["syft_action_data_type"] = type(v)
+            if not isinstance(v, ActionDataEmpty):
+                if inspect.isclass(v):
+                    values["syft_action_data_repr_"] = truncate_str(repr_cls(v))
+                else:
+                    values["syft_action_data_repr_"] = truncate_str(
+                        v._repr_markdown_()
+                        if v is not None and hasattr(v, "_repr_markdown_")
+                        else v.__repr__()
+                    )
+                values["syft_action_data_str_"] = truncate_str(str(v))
+                values["syft_has_bool_attr"] = hasattr(v, "__bool__")
+
         return values
 
     @property
@@ -845,9 +931,9 @@ class ActionObject(SyncableSyftObject):
     def is_twin(self) -> bool:
         return self.syft_twin_type != TwinMode.NONE
 
-    def syft_point_to(self, node_uid: UID) -> ActionObject:
-        """Set the syft_node_uid, used in the post hooks"""
-        self.syft_node_uid = node_uid
+    def syft_point_to(self, server_uid: UID) -> ActionObject:
+        """Set the syft_server_uid, used in the post hooks"""
+        self.syft_server_uid = server_uid
         return self
 
     def syft_get_property(self, obj: Any, method: str) -> Any:
@@ -861,6 +947,11 @@ class ActionObject(SyncableSyftObject):
         return isinstance(klass_method, property) or inspect.isdatadescriptor(
             klass_method
         )
+
+    def syft_eq(self, ext_obj: Self | None) -> bool:
+        if ext_obj is None:
+            return False
+        return self.id.id == ext_obj.id.id
 
     def syft_execute_action(
         self, action: Action, sync: bool = True
@@ -876,36 +967,42 @@ class ActionObject(SyncableSyftObject):
         Returns:
             ActionObjectPointer
         """
-        if self.syft_node_uid is None:
-            raise SyftException("Pointers can't execute without a node_uid.")
+        if self.syft_server_uid is None:
+            raise SyftException(
+                public_message="Pointers can't execute without a server_uid."
+            )
 
         # relative
-        from ...client.api import APIRegistry
         from ...client.api import SyftAPICall
 
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_uid,
-            user_verify_key=self.syft_client_verify_key,
-        )
-        if api is None:
-            raise ValueError(f"api is None. You must login to {self.syft_node_uid}")
+        api = self.get_api()
+        # if api is None:
+        #     raise ValueError(f"api is None. You must login to {self.syft_server_uid}")
         kwargs = {"action": action}
         api_call = SyftAPICall(
-            node_uid=self.syft_node_uid, path="action.execute", args=[], kwargs=kwargs
+            server_uid=self.syft_server_uid,
+            path="action.execute",
+            args=[],
+            kwargs=kwargs,
         )
-        return api.make_call(api_call)
+        res = api.make_call(api_call)
+        if isinstance(res, SyftSuccess):
+            return res.value  # type: ignore[return-value]
+        return res  # type: ignore[return-value]
 
-    def request(self, client: SyftClient) -> Any | SyftError:
+    def request(self, client: SyftClient) -> Any:
         # relative
         from ..request.request import ActionStoreChange
         from ..request.request import SubmitRequest
 
-        action_object_link = LinkedObject.from_obj(self, node_uid=self.syft_node_uid)
+        action_object_link = LinkedObject.from_obj(
+            self, server_uid=self.syft_server_uid
+        )
         permission_change = ActionStoreChange(
             linked_obj=action_object_link, apply_permission_type=ActionPermission.READ
         )
         if client.credentials is None:
-            return SyftError(f"{client} has no signing key")
+            raise SyftException(public_message=f"{client} has no signing key")
         submit_request = SubmitRequest(
             changes=[permission_change],
             requesting_user_verify_key=client.credentials.verify_key,
@@ -913,9 +1010,9 @@ class ActionObject(SyncableSyftObject):
         return client.api.services.request.submit(submit_request)
 
     def _syft_try_to_save_to_store(self, obj: SyftObject) -> None:
-        if self.syft_node_uid is None or self.syft_client_verify_key is None:
+        if self.syft_server_uid is None or self.syft_client_verify_key is None:
             return
-        elif obj.syft_node_uid is not None:
+        elif obj.syft_server_uid is not None:
             return
 
         if obj.syft_blob_storage_entry_id is not None:
@@ -929,10 +1026,9 @@ class ActionObject(SyncableSyftObject):
         # 3) it shouldnt send in the first place as it already exists
 
         # relative
-        from ...client.api import APIRegistry
 
-        if obj.syft_node_location is None:
-            obj.syft_node_location = obj.syft_node_uid
+        if obj.syft_server_location is None:
+            obj.syft_server_location = obj.syft_server_uid
 
         action = Action(
             path="",
@@ -949,21 +1045,19 @@ class ActionObject(SyncableSyftObject):
             trace_result = TraceResultRegistry.get_trace_result_for_thread()
             trace_result.result += [action]  # type: ignore
 
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_location,
-            user_verify_key=self.syft_client_verify_key,
-        )
-        if api is None:
-            print(
-                f"failed saving {obj} to blob storage, api is None. You must login to {self.syft_node_location}"
+        api = self.get_api_wrapped().unwrap(
+            public_message=(
+                f"Failed saving {obj} to blob storage, api is None."
+                f" You must login to {self.syft_server_location}."
             )
-            return
-        else:
-            obj._set_obj_location_(api.node_uid, api.signing_key.verify_key)  # type: ignore[union-attr]
+        )
 
-        res = api.services.action.execute(action)
-        if isinstance(res, SyftError):
-            print(f"Failed to to store (arg) {obj} to store, {res}")
+        obj._set_obj_location_(api.server_uid, api.signing_key.verify_key)  # type: ignore[union-attr]
+
+        try:
+            api.services.action.execute(action)
+        except Exception as e:
+            print(f"Failed to to store (arg) {obj} to store, {e}")
 
     def _syft_prepare_obj_uid(self, obj: Any) -> LineageID:
         # We got the UID
@@ -983,7 +1077,7 @@ class ActionObject(SyncableSyftObject):
         act_obj = ActionObject.from_obj(
             obj,
             syft_client_verify_key=self.syft_client_verify_key,
-            syft_node_location=self.syft_node_location,
+            syft_server_location=self.syft_server_location,
         )
 
         self._syft_try_to_save_to_store(act_obj)
@@ -1028,14 +1122,9 @@ class ActionObject(SyncableSyftObject):
         if kwargs is None:
             kwargs = {}
 
-        arg_ids = []
-        kwarg_ids = {}
+        arg_ids = [self._syft_prepare_obj_uid(obj) for obj in args]
 
-        for obj in args:
-            arg_ids.append(self._syft_prepare_obj_uid(obj))
-
-        for k, obj in kwargs.items():
-            kwarg_ids[k] = self._syft_prepare_obj_uid(obj)
+        kwarg_ids = {k: self._syft_prepare_obj_uid(obj) for k, obj in kwargs.items()}
 
         action = Action(
             path=path,
@@ -1080,6 +1169,15 @@ class ActionObject(SyncableSyftObject):
             action_type=action_type,
         )
 
+    def get_sync_dependencies(
+        self, context: AuthedServiceContext, **kwargs: dict
+    ) -> list[UID]:
+        try:
+            job = context.server.services.job.get_by_result_id(context, self.id.id)
+            return [job.id]
+        except SyftException:
+            return []
+
     def syft_get_path(self) -> str:
         """Get the type path of the underlying object"""
         if (
@@ -1114,14 +1212,28 @@ class ActionObject(SyncableSyftObject):
         return wrapper
 
     def send(self, client: SyftClient) -> Any:
-        return self._send(client, add_storage_permission=True)
+        return self._send(
+            server_uid=client.id,
+            verify_key=client.verify_key,
+            add_storage_permission=True,
+        )
 
-    def _send(self, client: SyftClient, add_storage_permission: bool = True) -> Self:
-        """Send the object to a Syft Client"""
-        self._set_obj_location_(client.id, client.verify_key)
-        self._save_to_blob_storage()
-        res = client.api.services.action.set(
-            self, add_storage_permission=add_storage_permission
+    def _send(
+        self,
+        server_uid: UID,
+        verify_key: SyftVerifyKey,
+        add_storage_permission: bool = True,
+    ) -> Self:
+        self._set_obj_location_(server_uid, verify_key)
+
+        blob_storage_res = self._save_to_blob_storage().unwrap()
+        api = self._get_api()
+
+        if isinstance(blob_storage_res, SyftWarning):
+            logger.debug(blob_storage_res.message)
+        res = api.services.action.set(
+            self,
+            add_storage_permission=add_storage_permission,
         )
         if isinstance(res, ActionObject):
             self.syft_created_at = res.syft_created_at
@@ -1130,26 +1242,20 @@ class ActionObject(SyncableSyftObject):
     def get_from(self, client: SyftClient) -> Any:
         """Get the object from a Syft Client"""
         res = client.api.services.action.get(self.id)
-        if not isinstance(res, ActionObject):
-            return SyftError(message=f"{res}")
-        else:
-            return res.syft_action_data
+        return res.syft_action_data
 
-    def refresh_object(self) -> ActionObject:
+    def refresh_object(self, resolve_nested: bool = True) -> ActionObject:
         # relative
-        from ...client.api import APIRegistry
-
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_location,
-            user_verify_key=self.syft_client_verify_key,
+        return self.get_api().services.action.get(
+            self.id, resolve_nested=resolve_nested
         )
-        if api is None:
-            return SyftError(
-                message=f"api is None. You must login to {self.syft_node_location}"
-            )
 
-        res = api.services.action.get(self.id)
-        return res
+    def has_storage_permission(self) -> bool:
+        try:
+            api = self.get_api()
+            return api.services.action.has_storage_permission(self.id.id)
+        except Exception:
+            return False
 
     def get(self, block: bool = False) -> Any:
         """Get the object from a Syft Client"""
@@ -1159,13 +1265,18 @@ class ActionObject(SyncableSyftObject):
             self.wait()
 
         res = self.refresh_object()
-
         if not isinstance(res, ActionObject):
-            return SyftError(message=f"{res}")  # type: ignore
+            raise SyftException(public_message=f"{res}")  # type: ignore
+        elif issubclass(res.syft_action_data_type, Err):
+            raise SyftException(public_message=f"{res.syft_action_data.err()}")
         else:
+            if not self.has_storage_permission():
+                prompt_warning_message(
+                    message="This is a placeholder object, the real data lives on a different server and is not synced."
+                )
             nested_res = res.syft_action_data
             if isinstance(nested_res, ActionObject):
-                nested_res.syft_node_location = res.syft_node_location
+                nested_res.syft_server_location = res.syft_server_location
                 nested_res.syft_client_verify_key = res.syft_client_verify_key
             return nested_res
 
@@ -1201,7 +1312,7 @@ class ActionObject(SyncableSyftObject):
         id: UID | None = None,
         syft_lineage_id: LineageID | None = None,
         syft_client_verify_key: SyftVerifyKey | None = None,
-        syft_node_location: UID | None = None,
+        syft_server_location: UID | None = None,
     ) -> ActionObject:
         """Create an Action Object from a file."""
         # relative
@@ -1223,8 +1334,8 @@ class ActionObject(SyncableSyftObject):
         if syft_client_verify_key is not None:
             action_object.syft_client_verify_key = syft_client_verify_key
 
-        if syft_node_location is not None:
-            action_object.syft_node_location = syft_node_location
+        if syft_server_location is not None:
+            action_object.syft_server_location = syft_server_location
 
         if syft_lineage_id is not None:
             action_object.id = syft_lineage_id.id
@@ -1240,9 +1351,9 @@ class ActionObject(SyncableSyftObject):
         id: UID | None = None,
         syft_lineage_id: LineageID | None = None,
         syft_client_verify_key: SyftVerifyKey | None = None,
-        syft_node_location: UID | None = None,
+        syft_server_location: UID | None = None,
         syft_resolved: bool | None = True,
-        data_node_id: UID | None = None,
+        data_server_id: UID | None = None,
         syft_blob_storage_entry_id: UID | None = None,
     ) -> ActionObject:
         """Create an ActionObject from an existing object.
@@ -1258,10 +1369,22 @@ class ActionObject(SyncableSyftObject):
         if id is not None and syft_lineage_id is not None and id != syft_lineage_id.id:
             raise ValueError("UID and LineageID should match")
 
+        # check if the object's type is supported
+        try:
+            SyftObjectRegistry.get_canonical_name_version(syft_action_data)
+        except Exception:
+            obj_type = type(syft_action_data)
+            raise SyftException(
+                public_message=(
+                    f"Error when creating action object for {syft_action_data}.\n"
+                    f"Unsupported data type: '{obj_type.__module__}.{obj_type.__name__}'"
+                )
+            )
+
         action_type = action_type_for_object(syft_action_data)
         action_object = action_type(syft_action_data_cache=syft_action_data)
         action_object.syft_blob_storage_entry_id = syft_blob_storage_entry_id
-        action_object.syft_action_data_node_id = data_node_id
+        action_object.syft_action_data_server_id = data_server_id
         action_object.syft_resolved = syft_resolved
 
         if id is not None:
@@ -1270,8 +1393,8 @@ class ActionObject(SyncableSyftObject):
         if syft_client_verify_key is not None:
             action_object.syft_client_verify_key = syft_client_verify_key
 
-        if syft_node_location is not None:
-            action_object.syft_node_location = syft_node_location
+        if syft_server_location is not None:
+            action_object.syft_server_location = syft_server_location
 
         if syft_lineage_id is not None:
             action_object.id = syft_lineage_id.id
@@ -1297,25 +1420,26 @@ class ActionObject(SyncableSyftObject):
 
     def wait(self, timeout: int | None = None) -> ActionObject:
         # relative
-        from ...client.api import APIRegistry
 
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_location,
-            user_verify_key=self.syft_client_verify_key,
-        )
+        api = self.get_api()
         if isinstance(self.id, LineageID):
             obj_id = self.id.id
         else:
             obj_id = self.id
 
         counter = 0
-        while api and not api.services.action.is_resolved(obj_id):
-            time.sleep(1)
-            if timeout is not None:
-                counter += 1
-                if counter > timeout:
-                    return SyftError(message="Reached Timeout!")
-
+        while api:
+            obj_resolved: bool | str = api.services.action.is_resolved(obj_id)
+            if isinstance(obj_resolved, str):
+                raise SyftException(public_message=obj_resolved)
+            if obj_resolved:
+                break
+            if not obj_resolved:
+                time.sleep(1)
+                if timeout is not None:
+                    counter += 1
+                    if counter > timeout:
+                        raise SyftException(public_message="Reached Timeout!")
         return self
 
     @staticmethod
@@ -1332,13 +1456,16 @@ class ActionObject(SyncableSyftObject):
 
     @staticmethod
     def obj_not_ready(
-        id: UID,
+        id: UID, syft_server_location: UID, syft_client_verify_key: SyftVerifyKey
     ) -> ActionObject:
         inner_obj = ObjectNotReady(obj_id=id)
 
         res = ActionObject.from_obj(
             id=id,
             syft_action_data=inner_obj,
+            syft_resolved=False,
+            syft_server_location=syft_server_location,
+            syft_client_verify_key=syft_client_verify_key,
         )
         return res
 
@@ -1350,7 +1477,7 @@ class ActionObject(SyncableSyftObject):
         id: UID | None = None,
         syft_lineage_id: LineageID | None = None,
         syft_resolved: bool | None = True,
-        data_node_id: UID | None = None,
+        data_server_id: UID | None = None,
         syft_blob_storage_entry_id: UID | None = None,
     ) -> Self:
         """Create an ActionObject from a type, using a ActionDataEmpty object
@@ -1373,7 +1500,7 @@ class ActionObject(SyncableSyftObject):
             syft_lineage_id=syft_lineage_id,
             syft_action_data=empty,
             syft_resolved=syft_resolved,
-            data_node_id=data_node_id,
+            data_server_id=data_server_id,
             syft_blob_storage_entry_id=syft_blob_storage_entry_id,
         )
         res.__dict__["syft_internal_type"] = syft_internal_type
@@ -1384,20 +1511,8 @@ class ActionObject(SyncableSyftObject):
         if HOOK_ALWAYS not in self.syft_pre_hooks__:
             self.syft_pre_hooks__[HOOK_ALWAYS] = []
 
-        if HOOK_ON_POINTERS not in self.syft_post_hooks__:
+        if HOOK_ON_POINTERS not in self.syft_pre_hooks__:
             self.syft_pre_hooks__[HOOK_ON_POINTERS] = []
-
-        # this should be a list as orders matters
-        for side_effect in [make_action_side_effect]:
-            if side_effect not in self.syft_pre_hooks__[HOOK_ALWAYS]:
-                self.syft_pre_hooks__[HOOK_ALWAYS].append(side_effect)
-
-        for side_effect in [send_action_side_effect]:
-            if side_effect not in self.syft_pre_hooks__[HOOK_ON_POINTERS]:
-                self.syft_pre_hooks__[HOOK_ON_POINTERS].append(side_effect)
-
-        if trace_action_side_effect not in self.syft_pre_hooks__[HOOK_ALWAYS]:
-            self.syft_pre_hooks__[HOOK_ALWAYS].append(trace_action_side_effect)
 
         if HOOK_ALWAYS not in self.syft_post_hooks__:
             self.syft_post_hooks__[HOOK_ALWAYS] = []
@@ -1405,14 +1520,57 @@ class ActionObject(SyncableSyftObject):
         if HOOK_ON_POINTERS not in self.syft_post_hooks__:
             self.syft_post_hooks__[HOOK_ON_POINTERS] = []
 
-        for side_effect in [propagate_node_uid]:
-            if side_effect not in self.syft_post_hooks__[HOOK_ALWAYS]:
-                self.syft_post_hooks__[HOOK_ALWAYS].append(side_effect)
+        api = self.get_api_wrapped()
+
+        eager_execution_enabled = (
+            api.is_ok()
+            and api.unwrap().metadata is not None
+            and api.unwrap().metadata.eager_execution_enabled  # type: ignore
+        )
+
+        self._syft_add_pre_hooks__(eager_execution_enabled)
+        self._syft_add_post_hooks__(eager_execution_enabled)
 
         if isinstance(self.syft_action_data_type, ActionObject):
             raise Exception("Nested ActionObjects", self.syft_action_data_repr_)
 
         self.syft_history_hash = hash(self.id)
+
+    def _syft_add_pre_hooks__(self, eager_execution: bool) -> None:
+        """
+        Add pre-hooks
+
+        Args:
+            eager_execution: bool: If eager execution is enabled, hooks for
+                tracing and executing the action on remote are added.
+        """
+
+        # this should be a list as orders matters
+        for side_effect in [make_action_side_effect]:
+            if side_effect not in self.syft_pre_hooks__[HOOK_ALWAYS]:
+                self.syft_pre_hooks__[HOOK_ALWAYS].append(side_effect)
+
+        if eager_execution:
+            for side_effect in [send_action_side_effect]:
+                if side_effect not in self.syft_pre_hooks__[HOOK_ON_POINTERS]:
+                    self.syft_pre_hooks__[HOOK_ON_POINTERS].append(side_effect)
+
+            if trace_action_side_effect not in self.syft_pre_hooks__[HOOK_ALWAYS]:
+                self.syft_pre_hooks__[HOOK_ALWAYS].append(trace_action_side_effect)
+
+    def _syft_add_post_hooks__(self, eager_execution: bool) -> None:
+        """
+        Add post-hooks
+
+        Args:
+            eager_execution: bool: If eager execution is enabled, hooks for
+                tracing and executing the action on remote are added.
+        """
+        if eager_execution:
+            # this should be a list as orders matters
+            for side_effect in [propagate_server_uid]:
+                if side_effect not in self.syft_post_hooks__[HOOK_ALWAYS]:
+                    self.syft_post_hooks__[HOOK_ALWAYS].append(side_effect)
 
     def _syft_run_pre_hooks__(
         self, context: PreHookContext, name: str, args: Any, kwargs: Any
@@ -1425,7 +1583,7 @@ class ActionObject(SyncableSyftObject):
                 if result.is_ok():
                     context, result_args, result_kwargs = result.ok()
                 else:
-                    debug(f"Pre-hook failed with {result.err()}")
+                    logger.debug(f"Pre-hook failed with {result.err()}")
         if name not in self._syft_dont_wrap_attrs():
             if HOOK_ALWAYS in self.syft_pre_hooks__:
                 for hook in self.syft_pre_hooks__[HOOK_ALWAYS]:
@@ -1433,8 +1591,9 @@ class ActionObject(SyncableSyftObject):
                     if result.is_ok():
                         context, result_args, result_kwargs = result.ok()
                     else:
-                        msg = result.err().replace("\\n", "\n")
-                        debug(f"Pre-hook failed with {msg}")
+                        msg = str(result.err())
+                        msg = msg.replace("\\n", "\n")
+                        logger.debug(f"Pre-hook failed with {msg}")
 
         if self.is_pointer:
             if name not in self._syft_dont_wrap_attrs():
@@ -1444,8 +1603,9 @@ class ActionObject(SyncableSyftObject):
                         if result.is_ok():
                             context, result_args, result_kwargs = result.ok()
                         else:
-                            msg = result.err().replace("\\n", "\n")
-                            debug(f"Pre-hook failed with {msg}")
+                            msg = str(result.err())
+                            msg = msg.replace("\\n", "\n")
+                            logger.debug(f"Pre-hook failed with {msg}")
 
         return context, result_args, result_kwargs
 
@@ -1460,7 +1620,7 @@ class ActionObject(SyncableSyftObject):
                 if result.is_ok():
                     new_result = result.ok()
                 else:
-                    debug(f"Post hook failed with {result.err()}")
+                    logger.debug(f"Post hook failed with {result.err()}")
 
         if name not in self._syft_dont_wrap_attrs():
             if HOOK_ALWAYS in self.syft_post_hooks__:
@@ -1469,7 +1629,7 @@ class ActionObject(SyncableSyftObject):
                     if result.is_ok():
                         new_result = result.ok()
                     else:
-                        debug(f"Post hook failed with {result.err()}")
+                        logger.debug(f"Post hook failed with {result.err()}")
 
         if self.is_pointer:
             if name not in self._syft_dont_wrap_attrs():
@@ -1479,7 +1639,7 @@ class ActionObject(SyncableSyftObject):
                         if result.is_ok():
                             new_result = result.ok()
                         else:
-                            debug(f"Post hook failed with {result.err()}")
+                            logger.debug(f"Post hook failed with {result.err()}")
 
         return new_result
 
@@ -1497,7 +1657,7 @@ class ActionObject(SyncableSyftObject):
         result = constructor(
             syft_twin_type=syft_twin_type,
             syft_action_data_cache=result,
-            syft_node_location=self.syft_node_location,
+            syft_server_location=self.syft_server_location,
             syft_client_verify_key=self.syft_client_verify_key,
         )
         return result
@@ -1514,8 +1674,6 @@ class ActionObject(SyncableSyftObject):
         """Find which instance - Syft ActionObject or the original object - has the requested attribute."""
         defined_on_self = name in self.__dict__ or name in self.__private_attributes__
 
-        debug(">> ", name, ", defined_on_self = ", defined_on_self)
-
         # use the custom defined version
         context_self = self
         if not defined_on_self:
@@ -1526,7 +1684,7 @@ class ActionObject(SyncableSyftObject):
     def _syft_attr_propagate_ids(
         self, context: PreHookContext, name: str, result: Any
     ) -> Any:
-        """Patch the results with the syft_history_hash, node_uid, and result_id."""
+        """Patch the results with the syft_history_hash, server_uid, and result_id."""
         if name in self._syft_dont_wrap_attrs():
             return result
 
@@ -1537,14 +1695,14 @@ class ActionObject(SyncableSyftObject):
         if context.action is not None:
             result.syft_history_hash = context.action.syft_history_hash
 
-        # Propagate Syft Node UID
-        result.syft_node_uid = context.node_uid
+        # Propagate Syft Server UID
+        result.syft_server_uid = context.server_uid
 
-        # Propogate Syft Node Location and Client Verify Key
-        result.syft_node_location = context.syft_node_location
+        # Propogate Syft Server Location and Client Verify Key
+        result.syft_server_location = context.syft_server_location
         result.syft_client_verify_key = context.syft_client_verify_key
 
-        # Propogate Syft blob storage entry id
+        # Propagate Syft blob storage entry id
         object_attrs = [
             "syft_blob_storage_entry_id",
             "syft_action_data_repr_",
@@ -1573,11 +1731,11 @@ class ActionObject(SyncableSyftObject):
                 "[_wrap_attribute_for_bool_on_nonbools] self.syft_action_data already implements the bool operator"
             )
 
-        debug("[__getattribute__] Handling bool on nonbools")
+        logger.debug("[__getattribute__] Handling bool on nonbools")
         context = PreHookContext(
             obj=self,
             op_name=name,
-            syft_node_location=self.syft_node_location,
+            syft_server_location=self.syft_server_location,
             syft_client_verify_key=self.syft_client_verify_key,
         )
         context, _, _ = self._syft_run_pre_hooks__(context, name, (), {})
@@ -1606,13 +1764,13 @@ class ActionObject(SyncableSyftObject):
             raise RuntimeError(
                 "[_wrap_attribute_for_properties] Use this only on properties"
             )
-        debug(f"[__getattribute__] Handling property {name} ")
+        logger.debug(f"[__getattribute__] Handling property {name}")
 
         context = PreHookContext(
             obj=self,
             op_name=name,
             action_type=ActionType.GETATTRIBUTE,
-            syft_node_location=self.syft_node_location,
+            syft_server_location=self.syft_server_location,
             syft_client_verify_key=self.syft_client_verify_key,
         )
         context, _, _ = self._syft_run_pre_hooks__(context, name, (), {})
@@ -1630,7 +1788,7 @@ class ActionObject(SyncableSyftObject):
         def fake_func(*args: Any, **kwargs: Any) -> Any:
             return ActionDataEmpty(syft_internal_type=self.syft_internal_type)
 
-        debug(f"[__getattribute__] Handling method {name} ")
+        logger.debug(f"[__getattribute__] Handling method {name}")
         if (
             issubclass(self.syft_action_data_type, ActionDataEmpty)
             and name not in action_data_empty_must_run
@@ -1646,7 +1804,7 @@ class ActionObject(SyncableSyftObject):
                 obj=self,
                 op_name=name,
                 action_type=ActionType.METHOD,
-                syft_node_location=self.syft_node_location,
+                syft_server_location=self.syft_server_location,
                 syft_client_verify_key=self.syft_client_verify_key,
             )
             context, pre_hook_args, pre_hook_kwargs = self._syft_run_pre_hooks__(
@@ -1667,20 +1825,20 @@ class ActionObject(SyncableSyftObject):
             return post_result
 
         if inspect.ismethod(original_func) or inspect.ismethoddescriptor(original_func):
-            debug("Running method: ", name)
+            logger.debug(f"Running method: {name}")
 
             def wrapper(_self: Any, *args: Any, **kwargs: Any) -> Any:
                 return _base_wrapper(*args, **kwargs)
 
             wrapper = types.MethodType(wrapper, type(self))
         else:
-            debug("Running non-method: ", name)
+            logger.debug(f"Running non-method: {name}")
 
             wrapper = _base_wrapper
 
         try:
             wrapper.__doc__ = original_func.__doc__
-            debug(
+            logger.debug(
                 "Found original signature for ",
                 name,
                 inspect.signature(original_func),
@@ -1689,7 +1847,7 @@ class ActionObject(SyncableSyftObject):
                 original_func
             )
         except Exception:
-            debug("name", name, "has no signature")
+            logger.debug(f"name={name} has no signature")
 
         # third party
         return wrapper
@@ -1713,7 +1871,7 @@ class ActionObject(SyncableSyftObject):
             obj=self,
             op_name=op_name,
             action_type=ActionType.SETATTRIBUTE,
-            syft_node_location=self.syft_node_location,
+            syft_server_location=self.syft_server_location,
             syft_client_verify_key=self.syft_client_verify_key,
         )
         context, pre_hook_args, pre_hook_kwargs = self._syft_run_pre_hooks__(
@@ -1744,6 +1902,10 @@ class ActionObject(SyncableSyftObject):
             name: str
                 The name of the attribute to access.
         """
+        # bypass ipython canary verification
+        if name == "_ipython_canary_method_should_not_exist_":
+            return None
+
         # bypass certain attrs to prevent recursion issues
         if name.startswith("_syft") or name.startswith("syft"):
             return object.__getattribute__(self, name)
@@ -1754,13 +1916,17 @@ class ActionObject(SyncableSyftObject):
         # third party
         if name in self._syft_passthrough_attrs():
             return object.__getattribute__(self, name)
-        context_self = self._syft_get_attr_context(name)
 
         # Handle bool operator on nonbools
         if name == "__bool__" and not self.syft_has_bool_attr:
             return self._syft_wrap_attribute_for_bool_on_nonbools(name)
 
+        # check cache first
+        if name in methods_to_check_in_cache:
+            return getattr(self.syft_action_data_cache, name, None)
+
         # Handle Properties
+        context_self = self._syft_get_attr_context(name)
         if self.syft_is_property(context_self, name):
             return self._syft_wrap_attribute_for_properties(name)
 
@@ -1770,12 +1936,12 @@ class ActionObject(SyncableSyftObject):
 
     @property
     def is_link(self) -> bool:
-        return isinstance(self.syft_action_data, ActionDataLink)
+        return self.syft_action_data_type is ActionDataLink
 
     def __setattr__(self, name: str, value: Any) -> Any:
         defined_on_self = name in self.__dict__ or name in self.__private_attributes__
 
-        debug(">> ", name, ", defined_on_self = ", defined_on_self)
+        logger.debug(f">> {name} defined_on_self={defined_on_self}")
 
         # use the custom defined version
         if defined_on_self:
@@ -1817,7 +1983,17 @@ class ActionObject(SyncableSyftObject):
                     else self.syft_action_data_cache.__repr__()
                 )
 
-        return f"```python\n{res}\n```\n{data_repr_}"
+        return f"\n**{res}**\n\n{data_repr_}\n"
+
+    def _data_repr(self) -> str | None:
+        if isinstance(self.syft_action_data_cache, ActionDataEmpty):
+            data_repr = self.syft_action_data_repr_
+        elif inspect.isclass(self.syft_action_data_cache):
+            data_repr = repr_cls(self.syft_action_data_cache)
+        else:
+            data_repr = self.syft_action_data_cache.__repr__()
+
+        return data_repr
 
     def __repr__(self) -> str:
         if self.is_mock:
@@ -1826,14 +2002,8 @@ class ActionObject(SyncableSyftObject):
             res = "TwinPointer(Real)"
         if not self.is_twin:
             res = "Pointer"
-        if isinstance(self.syft_action_data_cache, ActionDataEmpty):
-            data_repr_ = self.syft_action_data_repr_
-        else:
-            if inspect.isclass(self.syft_action_data_cache):
-                data_repr_ = repr_cls(self.syft_action_data_cache)
-            else:
-                data_repr_ = self.syft_action_data_cache.__repr__()
-        return f"{res}:\n{data_repr_}"
+        data_repr = self._data_repr()
+        return f"{res}:\n{data_repr}"
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         return self.__call__(*args, **kwds)
@@ -1996,8 +2166,13 @@ class ActionObject(SyncableSyftObject):
 
 @serializable()
 class AnyActionObject(ActionObject):
+    """
+    This is a catch-all class for all objects that are not
+    defined in the `action_types` dictionary.
+    """
+
     __canonical_name__ = "AnyActionObject"
-    __version__ = SYFT_OBJECT_VERSION_3
+    __version__ = SYFT_OBJECT_VERSION_1
 
     syft_internal_type: ClassVar[type[Any]] = NoneType  # type: ignore
     # syft_passthrough_attrs: List[str] = []
@@ -2015,13 +2190,13 @@ action_types[Any] = AnyActionObject
 
 
 def debug_original_func(name: str, func: Callable) -> None:
-    debug(f"{name} func is:")
-    debug("inspect.isdatadescriptor", inspect.isdatadescriptor(func))
-    debug("inspect.isgetsetdescriptor", inspect.isgetsetdescriptor(func))
-    debug("inspect.isfunction", inspect.isfunction(func))
-    debug("inspect.isbuiltin", inspect.isbuiltin(func))
-    debug("inspect.ismethod", inspect.ismethod(func))
-    debug("inspect.ismethoddescriptor", inspect.ismethoddescriptor(func))
+    logger.debug(f"{name} func is:")
+    logger.debug(f"inspect.isdatadescriptor = {inspect.isdatadescriptor(func)}")
+    logger.debug(f"inspect.isgetsetdescriptor = {inspect.isgetsetdescriptor(func)}")
+    logger.debug(f"inspect.isfunction = {inspect.isfunction(func)}")
+    logger.debug(f"inspect.isbuiltin = {inspect.isbuiltin(func)}")
+    logger.debug(f"inspect.ismethod = {inspect.ismethod(func)}")
+    logger.debug(f"inspect.ismethoddescriptor = {inspect.ismethoddescriptor(func)}")
 
 
 def is_action_data_empty(obj: Any) -> bool:
@@ -2035,7 +2210,7 @@ def has_action_data_empty(args: Any, kwargs: Any) -> bool:
         if is_action_data_empty(a):
             return True
 
-    for _, a in kwargs.items():
+    for a in kwargs.values():
         if is_action_data_empty(a):
             return True
     return False

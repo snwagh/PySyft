@@ -8,8 +8,75 @@ from typing import Any
 # syft absolute
 import syft as sy
 
+# relative
+from .decorators import deprecated
+
 RELATIVE_PATH_TO_FRONTEND = "/../../../../grid/frontend/"
 SCHEMA_FOLDER = "schema"
+
+GUEST_COMMANDS = """
+<li><span class='syft-code-block'>&lt;your_client&gt;.datasets</span> - list datasets</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.code</span> - list code</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.login</span> - list projects</li>
+"""
+
+DS_COMMANDS = """
+<li><span class='syft-code-block'>&lt;your_client&gt;.datasets</span> - list datasets</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.code</span> - list code</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.projects</span> - list projects</li>
+"""
+
+DO_COMMANDS = """
+<li><span class='syft-code-block'>&lt;your_client&gt;.projects</span> - list projects</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.requests</span> - list requests</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.users</span> - list users</li>
+"""
+
+DEFAULT_WELCOME_MSG = """
+        <style>
+            $FONT_CSS
+
+            .syft-container {
+                padding: 5px;
+                font-family: 'Open Sans';
+            }
+            .syft-alert-info {
+                color: #1F567A;
+                background-color: #C2DEF0;
+                border-radius: 4px;
+                padding: 5px;
+                padding: 13px 10px
+            }
+            .syft-code-block {
+                background-color: #f7f7f7;
+                border: 1px solid #cfcfcf;
+                padding: 0px 2px;
+            }
+            .syft-space {
+                margin-top: 1em;
+            }
+        </style>
+        <div class="syft-client syft-container">
+            <img src="$server_symbol" alt="Logo"
+            style="width:48px;height:48px;padding:3px;">
+            <h2>Welcome to $datasite_name</h2>
+            <div class="syft-space">
+            <strong>URL:</strong> $server_url <br />
+            <strong>Server Description:</strong> $description <br />
+            <strong>Server Type:</strong> $server_type <br />
+            <strong>Server Side Type:</strong>$server_side_type<br />
+            <strong>Syft Version:</strong> $server_version<br />
+
+            </div>
+            <div class='syft-alert-info syft-space'>
+                &#9432;&nbsp;
+                This datasite is run by the library PySyft to learn more about how it works visit
+                <a href="https://github.com/OpenMined/PySyft">github.com/OpenMined/PySyft</a>.
+            </div>
+            <h4>Commands to Get Started</h4>
+            $command_list
+        </div><br />
+        """
 
 # json schema primitive types
 primitive_mapping = {
@@ -116,7 +183,7 @@ def process_type_bank(type_bank: dict[str, tuple[Any, ...]]) -> dict[str, dict]:
 def resolve_references(json_mappings: dict[str, dict]) -> dict[str, dict]:
     # track second pass generated types
     new_types = {}
-    for _, json_schema in json_mappings.items():
+    for json_schema in json_mappings.values():
         replace_types = {}
         for attribute, config in json_schema["properties"].items():
             if "type" in config:
@@ -146,7 +213,11 @@ def resolve_references(json_mappings: dict[str, dict]) -> dict[str, dict]:
     return json_mappings
 
 
+@deprecated(
+    reason="generate_json_schemas is outdated, #1603 for more info",
+)
 def generate_json_schemas(output_path: str | None = None) -> None:
+    # TODO: should we also replace this with the SyftObjectRegistry?
     json_mappings = process_type_bank(sy.serde.recursive.TYPE_BANK)
     json_mappings = resolve_references(json_mappings)
     if not output_path:

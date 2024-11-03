@@ -29,17 +29,18 @@ jobs:
 
       - name: Install pip packages
         run: |
-          pip install --upgrade pip uv==0.1.18
+          python -m pip install --upgrade pip
+          pip install uv==0.4.1 tox==4.18.0 tox-uv==1.11.2
           uv --version
 
-      - name: Get pip cache dir
+      - name: Get uv cache dir
         id: pip-cache
         shell: bash
         run: |
           echo "dir=$(uv cache dir)" >> $GITHUB_OUTPUT
 
       # TODO: change cache key from setup.cfg to something more general
-      - name: pip cache
+      - name: Load github cache
         uses: actions/cache@v4
         with:
           path: ${{ steps.pip-cache.outputs.dir }}
@@ -47,12 +48,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-uv-py${{ matrix.python-version }}-
 
-      - name: Install Tox
-        run: |
-          pip install --upgrade tox tox-uv==1.5.1
-
       - uses: pre-commit/action@v3.0.1
 
       - name: Check Protocol Version
         run: |
           tox -e syft.protocol.check
+
+      - name: Generate API Snapshot Diff with latest beta
+        run: |
+          tox --recreate -e syft.api.snapshot

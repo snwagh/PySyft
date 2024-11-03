@@ -1,27 +1,33 @@
 # stdlib
+from enum import Enum
+import logging
+from multiprocessing import Process
 import threading
+from threading import Thread
 import time
 from typing import Any
+from typing import TYPE_CHECKING
 from typing import cast
 
 # third party
 import psutil
-from result import Err
-from result import Ok
-from result import Result
 
 # relative
-from ...node.credentials import SyftVerifyKey
-from ...node.worker_settings import WorkerSettings
 from ...serde.deserialize import _deserialize as deserialize
 from ...serde.serializable import serializable
+from ...server.credentials import SyftVerifyKey
+from ...server.worker_settings import WorkerSettings
 from ...service.context import AuthedServiceContext
-from ...store.document_store import BaseStash
+from ...store.linked_obj import LinkedObject
 from ...types.datetime import DateTime
+from ...types.errors import SyftException
 from ...types.uid import UID
 from ..job.job_stash import Job
-from ..job.job_stash import JobStash
 from ..job.job_stash import JobStatus
+from ..notification.email_templates import FailedJobTemplate
+from ..notification.notification_service import CreateNotification
+from ..notifier.notifier_enums import NOTIFIERS
+from ..queue.queue_service import QueueService
 from ..response import SyftError
 from ..response import SyftSuccess
 from ..worker.worker_stash import WorkerStash
@@ -33,12 +39,25 @@ from .base_queue import QueueProducer
 from .queue_stash import QueueItem
 from .queue_stash import Status
 
+if TYPE_CHECKING:
+    # relative
+    from .queue_stash import QueueStash
+
+logger = logging.getLogger(__name__)
+
+
+@serializable(canonical_name="WorkerType", version=1)
+class ConsumerType(str, Enum):
+    Thread = "thread"
+    Process = "process"
+    Synchronous = "synchronous"
+
 
 class MonitorThread(threading.Thread):
     def __init__(
         self,
         queue_item: QueueItem,
-        worker: Any,  # should be of type Worker(Node), but get circular import error
+        worker: Any,  # should be of type Worker(Server), but get circular import error
         credentials: SyftVerifyKey,
         interval: int = 5,
     ) -> None:
@@ -58,23 +77,31 @@ class MonitorThread(threading.Thread):
         # Implement the monitoring logic here
         job = self.worker.job_stash.get_by_uid(
             self.credentials, self.queue_item.job_id
-        ).ok()
-        if job is None or job.status != JobStatus.INTERRUPTED:
-            return
-        else:
-            job.resolved = True
+        ).unwrap()
+        if job and job.status == JobStatus.TERMINATING:
+            self.terminate(job)
+            for subjob in job.subjobs:
+                self.terminate(subjob)
+
             self.queue_item.status = Status.INTERRUPTED
             self.queue_item.resolved = True
             self.worker.queue_stash.set_result(self.credentials, self.queue_item)
-            self.worker.job_stash.set_result(self.credentials, job)
-            process = psutil.Process(job.job_pid)
-            process.terminate()
+            # How about subjobs of subjobs?
 
     def stop(self) -> None:
         self.stop_requested.set()
 
+    def terminate(self, job: Job) -> None:
+        job.resolved = True
+        job.status = JobStatus.INTERRUPTED
+        self.worker.job_stash.set_result(self.credentials, job)
+        try:
+            psutil.Process(job.job_pid).terminate()
+        except psutil.Error as e:
+            logger.warning(f"Failed to terminate job {job.id}: {e}")
 
-@serializable()
+
+@serializable(canonical_name="QueueManager", version=1)
 class QueueManager(BaseQueueManager):
     config: QueueConfig
 
@@ -82,7 +109,7 @@ class QueueManager(BaseQueueManager):
         self.client_config = self.config.client_config
         self._client = self.config.client_type(self.client_config)
 
-    def close(self) -> SyftError | SyftSuccess:
+    def close(self) -> SyftSuccess:
         return self._client.close()
 
     def create_consumer(
@@ -106,7 +133,7 @@ class QueueManager(BaseQueueManager):
     def create_producer(
         self,
         queue_name: str,
-        queue_stash: type[BaseStash],
+        queue_stash: "QueueStash",
         context: AuthedServiceContext,
         worker_stash: WorkerStash,
     ) -> QueueProducer:
@@ -121,7 +148,7 @@ class QueueManager(BaseQueueManager):
         self,
         message: bytes,
         queue_name: str,
-    ) -> SyftSuccess | SyftError:
+    ) -> SyftSuccess:
         return self._client.send_message(
             message=message,
             queue_name=queue_name,
@@ -150,21 +177,24 @@ def handle_message_multiprocessing(
     queue_config.client_config.n_consumers = 0
 
     # relative
-    from ...node.node import Node
+    from ...server.server import Server
 
-    worker = Node(
+    worker = Server(
         id=worker_settings.id,
         name=worker_settings.name,
         signing_key=worker_settings.signing_key,
-        document_store_config=worker_settings.document_store_config,
-        action_store_config=worker_settings.action_store_config,
+        db_config=worker_settings.db_config,
         blob_storage_config=worker_settings.blob_store_config,
+        server_side_type=worker_settings.server_side_type,
         queue_config=queue_config,
         is_subprocess=True,
         migrate=False,
+        deployment_type=worker_settings.deployment_type,
     )
 
-    job_item = worker.job_stash.get_by_uid(credentials, queue_item.job_id).ok()
+    # otherwise it reads it from env, resulting in the wrong credentials
+    worker.id = worker_settings.id
+    worker.signing_key = worker_settings.signing_key
 
     # Set monitor thread for this job.
     monitor_thread = MonitorThread(queue_item, worker, credentials)
@@ -173,13 +203,14 @@ def handle_message_multiprocessing(
     if queue_item.service == "user":
         queue_item.service = "userservice"
 
-    try:
-        call_method = getattr(worker.get_service(queue_item.service), queue_item.method)
+    # in case of error
+    result = None
 
+    try:
         role = worker.get_role_for_credentials(credentials=credentials)
 
         context = AuthedServiceContext(
-            node=worker,
+            server=worker,
             credentials=credentials,
             role=role,
             job_id=queue_item.job_id,
@@ -187,104 +218,94 @@ def handle_message_multiprocessing(
         )
 
         # relative
-        from ...node.node import AuthNodeContextRegistry
+        from ...server.server import AuthServerContextRegistry
 
-        AuthNodeContextRegistry.set_node_context(
-            node_uid=worker.id,
+        AuthServerContextRegistry.set_server_context(
+            server_uid=worker.id,
             context=context,
             user_verify_key=credentials,
         )
 
-        result: Any = call_method(context, *queue_item.args, **queue_item.kwargs)
+        call_method = getattr(worker.get_service(queue_item.service), queue_item.method)
+        result = call_method(context, *queue_item.args, **queue_item.kwargs)
+        status = Status.COMPLETED
+        job_status = JobStatus.COMPLETED
+    except Exception as e:
+        root_context = AuthedServiceContext(
+            server=context.server,
+            credentials=worker.signing_key.verify_key,  # type: ignore
+        )
+        link = LinkedObject.with_context(
+            queue_item, context=root_context, service_type=QueueService
+        )
+        message = CreateNotification(
+            subject=f"Job {queue_item.job_id} failed!",
+            from_user_verify_key=worker.signing_key.verify_key,  # type: ignore
+            to_user_verify_key=credentials,
+            linked_obj=link,
+            notifier_types=[NOTIFIERS.EMAIL],
+            email_template=FailedJobTemplate,
+        )
+        method = worker.services.notification.send
+        result = method(context=root_context, notification=message)
 
-        if isinstance(result, Ok):
-            status = Status.COMPLETED
-            job_status = JobStatus.COMPLETED
-            result = result.ok()
-        elif isinstance(result, SyftError) or isinstance(result, Err):
-            status = Status.ERRORED
-            job_status = JobStatus.ERRORED
-    except Exception as e:  # nosec
         status = Status.ERRORED
         job_status = JobStatus.ERRORED
-        # stdlib
-
-        raise e
-        # result = SyftError(
-        #     message=f"Failed with exception: {e}, {traceback.format_exc()}"
-        # )
-        # print("HAD AN ERROR WHILE HANDLING MESSAGE", result.message)
+        logger.exception("Unhandled error in handle_message_multiprocessing")
+        error_msg = e.public_message if isinstance(e, SyftException) else str(e)
+        result = SyftError(message=error_msg)
 
     queue_item.result = result
     queue_item.resolved = True
     queue_item.status = status
 
     # get new job item to get latest iter status
-    job_item = worker.job_stash.get_by_uid(credentials, job_item.id).ok()
+    job_item = worker.job_stash.get_by_uid(credentials, queue_item.job_id).unwrap(
+        public_message=f"Job {queue_item.job_id} not found!"
+    )
 
-    # if result.is_ok():
-
-    job_item.node_uid = worker.id
+    job_item.server_uid = worker.id  # type: ignore[assignment]
     job_item.result = result
     job_item.resolved = True
     job_item.status = job_status
 
-    worker.queue_stash.set_result(credentials, queue_item)
-    worker.job_stash.set_result(credentials, job_item)
+    worker.queue_stash.set_result(credentials, queue_item).unwrap(
+        public_message="Failed to set result into QueueItem after running"
+    )
+    worker.job_stash.set_result(credentials, job_item).unwrap(
+        public_message="Failed to set job after running"
+    )
 
     # Finish monitor thread
     monitor_thread.stop()
 
 
-def evaluate_can_run_job(
-    job_id: UID, job_stash: JobStash, credentials: SyftVerifyKey
-) -> Result[Job, str]:
-    """Evaluate if a Job can be executed by the user.
-
-    A Job cannot be executed if any of the following are met:
-    - User doesn't have permission to the job.
-    - Job is either marked Completed or result is available.
-    - Job is Cancelled or Interrupted.
-    """
-    res = job_stash.get_by_uid(credentials, job_id)
-
-    # User doesn't have access to job
-    if res.is_err():
-        return res
-
-    job_item = res.ok()
-
-    if job_item.status == JobStatus.COMPLETED or job_item.resolved:
-        return Err(f"Job: {job_id} already Completed.")
-    elif job_item.status == JobStatus.INTERRUPTED:
-        return Err(f"Job interrupted. Job Id: {job_id}")
-
-    return Ok(job_item)
-
-
-@serializable()
+@serializable(canonical_name="APICallMessageHandler", version=1)
 class APICallMessageHandler(AbstractMessageHandler):
     queue_name = "api_call"
 
     @staticmethod
     def handle_message(message: bytes, syft_worker_id: UID) -> None:
         # relative
-        from ...node.node import Node
+        from ...server.server import Server
 
         queue_item = deserialize(message, from_bytes=True)
+        queue_item = cast(QueueItem, queue_item)
         worker_settings = queue_item.worker_settings
+        if worker_settings is None:
+            raise ValueError("Worker settings are missing in the queue item.")
 
         queue_config = worker_settings.queue_config
         queue_config.client_config.create_producer = False
         queue_config.client_config.n_consumers = 0
 
-        worker = Node(
+        worker = Server(
             id=worker_settings.id,
             name=worker_settings.name,
             signing_key=worker_settings.signing_key,
-            document_store_config=worker_settings.document_store_config,
-            action_store_config=worker_settings.action_store_config,
-            blob_storage_config=worker_settings.blob_store_config,
+            db_config=worker_settings.db_config,
+            server_side_type=worker_settings.server_side_type,
+            deployment_type=worker_settings.deployment_type,
             queue_config=queue_config,
             is_subprocess=True,
             migrate=False,
@@ -295,57 +316,50 @@ class APICallMessageHandler(AbstractMessageHandler):
         worker.signing_key = worker_settings.signing_key
 
         credentials = queue_item.syft_client_verify_key
-
-        res = evaluate_can_run_job(queue_item.job_id, worker.job_stash, credentials)
-        if res.is_err():
-            raise Exception(res.value)
-        job_item: Job = res.ok()
+        try:
+            job_item: Job = worker.job_stash.get_by_uid(
+                credentials, queue_item.job_id
+            ).unwrap()  # type: ignore
+        except SyftException as exc:
+            logger.warning(exc._private_message or exc.public_message)
+            raise
 
         queue_item.status = Status.PROCESSING
-        queue_item.node_uid = worker.id
+        queue_item.server_uid = worker.id
 
         job_item.status = JobStatus.PROCESSING
-        job_item.node_uid = cast(UID, worker.id)
+        job_item.server_uid = worker.id  # type: ignore[assignment]
         job_item.updated_at = DateTime.now()
 
-        # try:
-        #     worker_name = os.getenv("DOCKER_WORKER_NAME", None)
-        #     docker_worker = worker.worker_stash.get_worker_by_name(
-        #         credentials, worker_name
-        #     ).ok()
-        #     job_item.job_worker_id = str(docker_worker.container_id)
-        # except Exception:
-        #     job_item.job_worker_id = str(worker.id)
         if syft_worker_id is not None:
             job_item.job_worker_id = syft_worker_id
 
-        queue_result = worker.queue_stash.set_result(credentials, queue_item)
-        if isinstance(queue_result, SyftError):
-            raise Exception(f"{queue_result.err()}")
+        worker.queue_stash.set_result(credentials, queue_item).unwrap()
+        worker.job_stash.set_result(credentials, job_item).unwrap()
 
-        job_result = worker.job_stash.set_result(credentials, job_item)
-        if isinstance(job_result, SyftError):
-            raise Exception(f"{job_result.err()}")
+        logger.info(
+            f"Handling queue item: id={queue_item.id}, method={queue_item.method} "
+            f"args={queue_item.args}, kwargs={queue_item.kwargs} "
+            f"service={queue_item.service}, as={queue_config.consumer_type}"
+        )
 
-        if queue_config.thread_workers:
-            # stdlib
-            from threading import Thread
-
+        if queue_config.consumer_type == ConsumerType.Thread:
             thread = Thread(
                 target=handle_message_multiprocessing,
                 args=(worker_settings, queue_item, credentials),
             )
             thread.start()
             thread.join()
-        else:
-            # stdlib
-            from multiprocessing import Process
-
+        elif queue_config.consumer_type == ConsumerType.Process:
+            # if psutil.pid_exists(job_item.job_pid):
+            #     psutil.Process(job_item.job_pid).terminate()
             process = Process(
                 target=handle_message_multiprocessing,
                 args=(worker_settings, queue_item, credentials),
             )
             process.start()
             job_item.job_pid = process.pid
-            worker.job_stash.set_result(credentials, job_item)
+            worker.job_stash.set_result(credentials, job_item).unwrap()
             process.join()
+        elif queue_config.consumer_type == ConsumerType.Synchronous:
+            handle_message_multiprocessing(worker_settings, queue_item, credentials)

@@ -1,6 +1,7 @@
 # stdlib
 from collections.abc import Generator
 from io import BytesIO
+import logging
 import math
 from queue import Queue
 import threading
@@ -11,7 +12,12 @@ import boto3
 from botocore.client import BaseClient as S3BaseClient
 from botocore.client import ClientError as BotoClientError
 from botocore.client import Config
+from botocore.exceptions import ConnectionError
 import requests
+from tenacity import retry
+from tenacity import retry_if_exception_type
+from tenacity import stop_after_delay
+from tenacity import wait_fixed
 from tqdm import tqdm
 from typing_extensions import Self
 
@@ -24,38 +30,43 @@ from . import BlobStorageConfig
 from . import BlobStorageConnection
 from ...serde.serializable import serializable
 from ...service.blob_storage.remote_profile import AzureRemoteProfile
-from ...service.response import SyftError
 from ...service.response import SyftSuccess
 from ...service.service import from_api_or_context
 from ...types.blob_storage import BlobStorageEntry
 from ...types.blob_storage import CreateBlobStorageEntry
 from ...types.blob_storage import SeaweedSecureFilePathLocation
 from ...types.blob_storage import SecureFilePathLocation
-from ...types.grid_url import GridURL
-from ...types.syft_object import SYFT_OBJECT_VERSION_3
+from ...types.errors import SyftException
+from ...types.result import as_result
+from ...types.server_url import ServerURL
+from ...types.syft_object import SYFT_OBJECT_VERSION_1
+from ...types.uid import UID
 from ...util.constants import DEFAULT_TIMEOUT
+from ...util.telemetry import instrument_botocore
 
+MAX_QUEUE_SIZE = 100
 WRITE_EXPIRATION_TIME = 900  # seconds
-DEFAULT_FILE_PART_SIZE = (1024**3) * 5  # 5GB
-DEFAULT_UPLOAD_CHUNK_SIZE = 819200
+DEFAULT_FILE_PART_SIZE = 1024**3  # 1GB
+DEFAULT_UPLOAD_CHUNK_SIZE = 1024 * 800  # 800KB
+
+logger = logging.getLogger(__name__)
+
+instrument_botocore()
 
 
 @serializable()
 class SeaweedFSBlobDeposit(BlobDeposit):
     __canonical_name__ = "SeaweedFSBlobDeposit"
-    __version__ = SYFT_OBJECT_VERSION_3
+    __version__ = SYFT_OBJECT_VERSION_1
 
-    urls: list[GridURL]
+    urls: list[ServerURL]
     size: int
+    proxy_server_uid: UID | None = None
 
-    def write(self, data: BytesIO) -> SyftSuccess | SyftError:
+    @as_result(SyftException)
+    def write(self, data: BytesIO) -> SyftSuccess:
         # relative
-        from ...client.api import APIRegistry
-
-        api = APIRegistry.api_for(
-            node_uid=self.syft_node_location,
-            user_verify_key=self.syft_client_verify_key,
-        )
+        api = self.get_api_wrapped()
 
         etags = []
 
@@ -74,15 +85,22 @@ class SeaweedFSBlobDeposit(BlobDeposit):
             with tqdm(
                 total=total_iterations,
                 desc=f"Uploading progress",  # noqa
+                colour="green",
             ) as pbar:
                 for part_no, url in enumerate(
                     self.urls,
                     start=1,
                 ):
-                    if api is not None and api.connection is not None:
-                        blob_url = api.connection.to_blob_route(
-                            url.url_path, host=url.host_or_ip
-                        )
+                    if api.is_ok() and api.unwrap().connection is not None:
+                        api = api.unwrap()
+                        if self.proxy_server_uid is None:
+                            blob_url = api.connection.to_blob_route(  # type: ignore [union-attr]
+                                url.url_path, host=url.host_or_ip
+                            )
+                        else:
+                            blob_url = api.connection.stream_via(  # type: ignore [union-attr]
+                                self.proxy_server_uid, url.url_path
+                            )
                     else:
                         blob_url = url
 
@@ -94,7 +112,7 @@ class SeaweedFSBlobDeposit(BlobDeposit):
                         def async_generator(
                             self, chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
                         ) -> Generator:
-                            item_queue: Queue = Queue()
+                            item_queue: Queue = Queue(maxsize=MAX_QUEUE_SIZE)
                             threading.Thread(
                                 target=self.add_chunks_to_queue,
                                 kwargs={"queue": item_queue, "chunk_size": chunk_size},
@@ -114,16 +132,17 @@ class SeaweedFSBlobDeposit(BlobDeposit):
                             """Creates a data geneator for the part"""
                             n = 0
 
-                            while n * chunk_size <= part_size:
-                                try:
+                            try:
+                                while n * chunk_size <= part_size:
                                     chunk = data.read(chunk_size)
+                                    if not chunk:
+                                        break
                                     self.no_lines += chunk.count(b"\n")
                                     n += 1
                                     queue.put(chunk)
-                                except BlockingIOError:
-                                    # if end of file, stop
-                                    queue.put(0)
-                            # if end of part, stop
+                            except BlockingIOError:
+                                pass
+                            # if end of file or part, stop
                             queue.put(0)
 
                     gen = PartGenerator()
@@ -141,22 +160,23 @@ class SeaweedFSBlobDeposit(BlobDeposit):
                     etags.append({"ETag": etag, "PartNumber": part_no})
 
         except requests.RequestException as e:
-            print(e)
-            return SyftError(message=str(e))
+            raise SyftException(
+                public_message=f"Failed to upload file to SeaweedFS - {e}"
+            )
 
         mark_write_complete_method = from_api_or_context(
             func_or_path="blob_storage.mark_write_complete",
-            syft_node_location=self.syft_node_location,
+            syft_server_location=self.syft_server_location,
             syft_client_verify_key=self.syft_client_verify_key,
         )
         if mark_write_complete_method is None:
-            return SyftError(message="mark_write_complete_method is None")
+            raise SyftException(public_message="mark_write_complete_method is None")
         return mark_write_complete_method(
             etags=etags, uid=self.blob_storage_entry_id, no_lines=no_lines
         )
 
 
-@serializable()
+@serializable(canonical_name="SeaweedFSClientConfig", version=1)
 class SeaweedFSClientConfig(BlobStorageClientConfig):
     host: str
     port: int
@@ -169,8 +189,8 @@ class SeaweedFSClientConfig(BlobStorageClientConfig):
 
     @property
     def endpoint_url(self) -> str:
-        grid_url = GridURL(host_or_ip=self.host, port=self.port)
-        return grid_url.url
+        server_url = ServerURL(host_or_ip=self.host, port=self.port)
+        return server_url.url
 
     @property
     def mount_url(self) -> str:
@@ -179,7 +199,7 @@ class SeaweedFSClientConfig(BlobStorageClientConfig):
         return f"http://{self.host}:{self.mount_port}/configure_azure"
 
 
-@serializable()
+@serializable(canonical_name="SeaweedFSClient", version=1)
 class SeaweedFSClient(BlobStorageClient):
     config: SeaweedFSClientConfig
 
@@ -198,7 +218,7 @@ class SeaweedFSClient(BlobStorageClient):
         )
 
 
-@serializable()
+@serializable(canonical_name="SeaweedFSConnection", version=1)
 class SeaweedFSConnection(BlobStorageConnection):
     client: S3BaseClient
     default_bucket_name: str
@@ -214,11 +234,21 @@ class SeaweedFSConnection(BlobStorageConnection):
         self.default_bucket_name = default_bucket_name
         self.config = config
 
+        self._check_connection()
+
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: Any) -> None:
         self.client.close()
+
+    @retry(
+        wait=wait_fixed(5),
+        stop=stop_after_delay(60),
+        retry=retry_if_exception_type(ConnectionError),
+    )
+    def _check_connection(self) -> dict:
+        return self.client.list_buckets()
 
     def read(
         self,
@@ -232,9 +262,7 @@ class SeaweedFSConnection(BlobStorageConnection):
         # that decides whether to use a direct connection to azure/aws/gcp or via seaweed
         return fp.generate_url(self, type_, bucket_name)
 
-    def allocate(
-        self, obj: CreateBlobStorageEntry
-    ) -> SecureFilePathLocation | SyftError:
+    def allocate(self, obj: CreateBlobStorageEntry) -> SecureFilePathLocation:
         try:
             file_name = obj.file_name
             result = self.client.create_multipart_upload(
@@ -244,15 +272,15 @@ class SeaweedFSConnection(BlobStorageConnection):
             upload_id = result["UploadId"]
             return SeaweedSecureFilePathLocation(upload_id=upload_id, path=file_name)
         except BotoClientError as e:
-            return SyftError(
-                message=f"Failed to allocate space for {obj} with error: {e}"
+            raise SyftException(
+                public_message=f"Failed to allocate space for {obj} with error: {e}"
             )
 
     def write(self, obj: BlobStorageEntry) -> BlobDeposit:
         total_parts = math.ceil(obj.file_size / DEFAULT_FILE_PART_SIZE)
 
         urls = [
-            GridURL.from_url(
+            ServerURL.from_url(
                 self.client.generate_presigned_url(
                     ClientMethod="upload_part",
                     Params={
@@ -274,7 +302,7 @@ class SeaweedFSConnection(BlobStorageConnection):
         self,
         blob_entry: BlobStorageEntry,
         etags: list,
-    ) -> SyftError | SyftSuccess:
+    ) -> SyftSuccess:
         try:
             self.client.complete_multipart_upload(
                 Bucket=self.default_bucket_name,
@@ -284,20 +312,20 @@ class SeaweedFSConnection(BlobStorageConnection):
             )
             return SyftSuccess(message="Successfully saved file.")
         except BotoClientError as e:
-            return SyftError(message=str(e))
+            raise SyftException(public_message=str(e))
 
     def delete(
         self,
         fp: SecureFilePathLocation,
-    ) -> SyftSuccess | SyftError:
+    ) -> SyftSuccess:
         try:
             self.client.delete_object(Bucket=self.default_bucket_name, Key=fp.path)
             return SyftSuccess(message="Successfully deleted file.")
         except BotoClientError as e:
-            return SyftError(message=str(e))
+            raise SyftException(public_message=str(e))
 
 
-@serializable()
+@serializable(canonical_name="SeaweedFSConfig", version=1)
 class SeaweedFSConfig(BlobStorageConfig):
     client_type: type[BlobStorageClient] = SeaweedFSClient
     client_config: SeaweedFSClientConfig

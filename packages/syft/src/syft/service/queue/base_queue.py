@@ -1,23 +1,26 @@
 # stdlib
 from typing import Any
 from typing import ClassVar
+from typing import TYPE_CHECKING
 
 # relative
 from ...serde.serializable import serializable
 from ...service.context import AuthedServiceContext
-from ...store.document_store import BaseStash
 from ...types.uid import UID
-from ..response import SyftError
 from ..response import SyftSuccess
 from ..worker.worker_stash import WorkerStash
 
+if TYPE_CHECKING:
+    # relative
+    from .queue_stash import QueueStash
 
-@serializable()
+
+@serializable(canonical_name="QueueClientConfig", version=1)
 class QueueClientConfig:
     pass
 
 
-@serializable()
+@serializable(canonical_name="AbstractMessageHandler", version=1)
 class AbstractMessageHandler:
     queue_name: ClassVar[str]
 
@@ -26,7 +29,11 @@ class AbstractMessageHandler:
         raise NotImplementedError
 
 
-@serializable(attrs=["message_handler", "queue_name", "address"])
+@serializable(
+    attrs=["message_handler", "queue_name", "address"],
+    canonical_name="QueueConsumer",
+    version=1,
+)
 class QueueConsumer:
     message_handler: AbstractMessageHandler
     queue_name: str
@@ -42,7 +49,7 @@ class QueueConsumer:
         raise NotImplementedError
 
 
-@serializable()
+@serializable(canonical_name="QueueProducer", version=1)
 class QueueProducer:
     queue_name: str
 
@@ -61,13 +68,13 @@ class QueueProducer:
         raise NotImplementedError
 
 
-@serializable()
+@serializable(canonical_name="QueueClient", version=1)
 class QueueClient:
     def __init__(self, config: QueueClientConfig) -> None:
         raise NotImplementedError
 
 
-@serializable()
+@serializable(canonical_name="QueueConfig", version=1)
 class QueueConfig:
     """Base Queue configuration"""
 
@@ -75,7 +82,7 @@ class QueueConfig:
     client_config: QueueClientConfig
 
 
-@serializable()
+@serializable(canonical_name="BaseQueueManager", version=1)
 class BaseQueueManager:
     config: QueueConfig
 
@@ -86,7 +93,7 @@ class BaseQueueManager:
     def post_init(self) -> None:
         pass
 
-    def close(self) -> SyftError | SyftSuccess:
+    def close(self) -> SyftSuccess:
         raise NotImplementedError
 
     def create_consumer(
@@ -102,13 +109,13 @@ class BaseQueueManager:
     def create_producer(
         self,
         queue_name: str,
-        queue_stash: type[BaseStash],
+        queue_stash: "QueueStash",
         context: AuthedServiceContext,
         worker_stash: WorkerStash,
     ) -> QueueProducer:
         raise NotImplementedError
 
-    def send(self, message: bytes, queue_name: str) -> SyftSuccess | SyftError:
+    def send(self, message: bytes, queue_name: str) -> SyftSuccess:
         raise NotImplementedError
 
     @property

@@ -1,119 +1,93 @@
 ARG PYTHON_VERSION="3.12"
-ARG TZ="Etc/UTC"
+ARG UV_VERSION="0.2.13-r0"
+ARG TORCH_VERSION="2.2.2"
 
-# change to USER="syftuser", UID=1000 and HOME="/home/$USER" for rootless
-ARG USER="root"
-ARG UID=0
-ARG USER_GRP=$USER:$USER
-ARG HOME="/root"
-ARG APPDIR="$HOME/app"
+# wolfi-os pkg definition links
+# https://github.com/wolfi-dev/os/blob/main/python-3.12.yaml
+# https://github.com/wolfi-dev/os/blob/main/py3-pip.yaml
+# https://github.com/wolfi-dev/os/blob/main/uv.yaml
 
 # ==================== [BUILD STEP] Python Dev Base ==================== #
 
-FROM cgr.dev/chainguard/wolfi-base as python_dev
+FROM cgr.dev/chainguard/wolfi-base AS syft_deps
 
 ARG PYTHON_VERSION
-ARG TZ
-ARG USER
-ARG UID
+ARG UV_VERSION
+ARG TORCH_VERSION
 
 # Setup Python DEV
-RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
-    apk update && \
-    apk upgrade && \
-    apk add build-base gcc tzdata python-$PYTHON_VERSION-dev-default py$PYTHON_VERSION-pip && \
-    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-# uncomment for creating rootless user
-# && adduser -D -u $UID $USER
+RUN apk update && apk upgrade && \
+    apk add build-base gcc python-$PYTHON_VERSION-dev uv=$UV_VERSION && \
+    # preemptive fix for wolfi-os breaking python entrypoint
+    (test -f /usr/bin/python || ln -s /usr/bin/python3.12 /usr/bin/python)
 
-# ==================== [BUILD STEP] Install Syft Dependency ==================== #
+WORKDIR /root/app
 
-FROM python_dev as syft_deps
+ENV UV_HTTP_TIMEOUT=600
 
-ARG APPDIR
-ARG HOME
-ARG UID
-ARG USER
-ARG USER_GRP
+# keep static deps separate to have each layer cached independently
+# if amd64 then we need to append +cpu to the torch version
+# uv issues: https://github.com/astral-sh/uv/issues/3437 & https://github.com/astral-sh/uv/issues/2541
+RUN --mount=type=cache,target=/root/.cache,sharing=locked \
+    uv venv && \
+    ARCH=$(arch | sed s/aarch64/arm64/ | sed s/x86_64/amd64/) && \
+    if [[ "$ARCH" = "amd64" ]]; then TORCH_VERSION="$TORCH_VERSION+cpu"; fi && \
+    uv pip install torch==$TORCH_VERSION --index-url https://download.pytorch.org/whl/cpu
 
-USER $USER
-WORKDIR $APPDIR
-ENV PATH=$PATH:$HOME/.local/bin
+COPY syft/setup.py syft/setup.cfg syft/pyproject.toml ./syft/
 
-# copy skeleton to do package install
-COPY --chown=$USER_GRP \
-    syft/setup.py \
-    syft/setup.cfg \
-    syft/pyproject.toml \
-    syft/MANIFEST.in \
-    syft/
+COPY syft/src/syft/VERSION ./syft/src/syft/
 
-COPY --chown=$USER_GRP \
-    syft/src/syft/VERSION \
-    syft/src/syft/capnp \
-    syft/src/syft/
-
-# Install all dependencies together here to avoid any version conflicts across pkgs
-RUN --mount=type=cache,id=pip-$UID,target=$HOME/.cache/pip,uid=$UID,gid=$UID,sharing=locked \
-    pip install --user --default-timeout=300 torch==2.2.1 -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
-    pip install --user pip-autoremove jupyterlab -e ./syft[data_science] && \
-    pip-autoremove ansible ansible-core -y
+RUN --mount=type=cache,target=/root/.cache,sharing=locked \
+    # remove torch because we already have the cpu version pre-installed
+    sed --in-place /torch==/d ./syft/setup.cfg && \
+    uv pip install -e ./syft[data_science,telemetry]
 
 # ==================== [Final] Setup Syft Server ==================== #
 
-FROM cgr.dev/chainguard/wolfi-base as backend
+FROM cgr.dev/chainguard/wolfi-base AS backend
 
-# inherit from global
-ARG APPDIR
-ARG HOME
 ARG PYTHON_VERSION
-ARG TZ
-ARG USER
-ARG USER_GRP
+ARG UV_VERSION
 
-# Setup Python
-RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
-    apk update && \
-    apk upgrade && \
-    apk add tzdata git bash python-$PYTHON_VERSION-default py$PYTHON_VERSION-pip && \
-    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
-    # Uncomment for rootless user
-    # adduser -D -u 1000 $USER && \
-    mkdir -p /var/log/pygrid $HOME/data/creds $HOME/data/db $HOME/.cache $HOME/.local
-# chown -R $USER_GRP /var/log/pygrid $HOME/
+RUN apk update && apk upgrade && \
+    apk add --no-cache git bash python-$PYTHON_VERSION py$PYTHON_VERSION-pip uv=$UV_VERSION && \
+    # preemptive fix for wolfi-os breaking python entrypoint
+    (test -f /usr/bin/python || ln -s /usr/bin/python3.12 /usr/bin/python)
 
-USER $USER
-WORKDIR $APPDIR
+WORKDIR /root/app/
+
+# Copy pre-built syft dependencies
+COPY --from=syft_deps /root/app/.venv .venv
+
+# copy server
+COPY grid/backend/grid ./grid/
+
+# copy syft
+COPY syft ./syft/
 
 # Update environment variables
-ENV PATH=$PATH:$HOME/.local/bin \
-    PYTHONPATH=$APPDIR \
-    APPDIR=$APPDIR \
-    NODE_NAME="default_node_name" \
-    NODE_TYPE="domain" \
-    SERVICE_NAME="backend" \
+ENV \
+    # "activate" venv
+    PATH="/root/app/.venv/bin/:$PATH" \
+    VIRTUAL_ENV="/root/app/.venv" \
+    # Syft
+    APPDIR="/root/app" \
+    SERVER_NAME="default_server_name" \
+    SERVER_TYPE="datasite" \
+    SERVER_SIDE_TYPE="high" \
     RELEASE="production" \
     DEV_MODE="False" \
     DEBUGGER_ENABLED="False" \
+    TRACING="False" \
     CONTAINER_HOST="docker" \
-    OBLV_ENABLED="False" \
-    OBLV_LOCALHOST_PORT=3030 \
     DEFAULT_ROOT_EMAIL="info@openmined.org" \
     DEFAULT_ROOT_PASSWORD="changethis" \
     STACK_API_KEY="changeme" \
-    MONGO_HOST="localhost" \
-    MONGO_PORT="27017" \
-    MONGO_USERNAME="root" \
-    MONGO_PASSWORD="example" \
-    CREDENTIALS_PATH="$HOME/data/creds/credentials.json"
-
-# Copy pre-built jupyterlab, syft dependencies
-COPY --chown=$USER_GRP --from=syft_deps $HOME/.local $HOME/.local
-
-# copy grid
-COPY --chown=$USER_GRP grid/backend/grid grid/backend/worker_cpu.dockerfile ./grid/
-
-# copy syft
-COPY --chown=$USER_GRP syft/ ./syft/
+    POSTGRESQL_DBNAME="syftdb_postgres" \
+    POSTGRESQL_HOST="localhost" \
+    POSTGRESQL_PORT="5432" \
+    POSTGRESQL_USERNAME="syft_postgres" \
+    POSTGRESQL_PASSWORD="example"
 
 CMD ["bash", "./grid/start.sh"]
